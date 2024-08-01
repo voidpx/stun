@@ -1,6 +1,6 @@
 # A simple tunnel
 
-this is a simple tunnel using pre-shared key for encryption. it tunnels both ipv4 and ipv6 packets into a ipv4 tunnel. this program uses the `ip` and `iptables` & `ip6tables` commands to manipulate ip addresses, routes and ip tables, so it requires the user to have corresponding capabilities, or simply run as root.
+this is a simple tunnel using pre-shared key for encryption. it tunnels both ipv4 and ipv6 packets into a ipv4 tunnel. this program uses the `ip` and `iptables` & `ip6tables` commands to manipulate ip addresses, routes and ip tables, so it requires the user to have corresponding capabilities, or simply run as root. this program uses the `crypto` lib for encryption.
 
 ### usage
 
