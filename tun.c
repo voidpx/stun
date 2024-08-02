@@ -379,7 +379,7 @@ static void *to_tun(void *hc) {
 			int s = sendto(c->sofd, b, left, 0, (struct sockaddr *)&c->peer, sizeof(c->peer));
 			if (s == -1) {
 				perror("sendto error");
-				if (s == ENETUNREACH) {
+				if (errno == ENETUNREACH) {
 					printf("reconfiguring routes\n");
 					setup_routes(c);
 				}
