@@ -171,13 +171,22 @@ static void setup_int() {
 #define _CMD(call) \
 	do {if ((call)) exit(1);} while(0)
 
-static void setup_routes(ctx *c) {
+static void setup_routes(ctx *c, int reconfig) {
 	char *dev = c->tundev;
 	if (c->mode == CLIENT) {
-		_CMD(exec_cmd("ip route add default via 10.0.0.2 dev %s metric 10", dev));
-		_CMD(exec_cmd("ip route add %s via %s dev %s", c->vs, c->gw, c->mif));
+		int err = exec_cmd("ip route add default via 10.0.0.2 dev %s metric 10", dev);
+		if (!reconfig) {
+			_CMD(err);
+		}
+		err = exec_cmd("ip route add %s via %s dev %s", c->vs, c->gw, c->mif);
+		if (!reconfig) {
+			_CMD(err);
+		}
 		// v6
-		exec_cmd("ip -6 route add ::/0 dev %s metric 10", dev);
+		err = exec_cmd("ip -6 route add ::/0 dev %s metric 10", dev);
+		if (!reconfig) {
+			_CMD(err);
+		}
 	} else {
 		_CMD(exec_cmd("ip route add 10.0.0.0/24 dev %s", dev));
 		// v6
@@ -202,7 +211,7 @@ static void setup_dev(ctx *c) {
 		_CMD(exec_cmd("ip -6 addr add fc00::1/128 dev %s", dev));
 		_CMD(exec_cmd("ip6tables -t nat -A POSTROUTING -o %s -j MASQUERADE -s fc00::/120", c->mif));
 	}
-	setup_routes(c);
+	setup_routes(c, 0);
 	setup_int();
 }
 
@@ -280,6 +289,35 @@ static inline int check_mc(unsigned char *ip) {
 	return 0;
 }
 
+static int std_write(ctx *c, int fd, unsigned char *buf, int len) {
+	return write(fd, buf, len);
+}
+
+static int _sendto(ctx *c, int fd, unsigned char *buf, int len) {
+	return sendto(fd, buf, len, 0, (struct sockaddr *)&c->peer, sizeof(c->peer));
+}
+
+static int _write_all(ctx *c, int fd, unsigned char *buf, int len,
+		int (*out)(ctx *c, int, unsigned char*, int)) {
+	int left = len;
+	unsigned char *b = buf;
+	do {
+		int w = out(c, fd, b, left);
+		if (w == -1) {
+			perror("write error");
+			return errno;
+		}
+		left -= w;
+		if (!left) {
+			return 0;
+		}
+		b+=w;
+		pr_debug("failed to write all at once to tunnel device, probably write queue is full\n");
+		// busy loop yield
+		sched_yield();
+	} while (1);
+}
+
 static void *from_tun(void *hc) {
 	ctx *c = (ctx *)hc;
 	int sfd = c->sofd;
@@ -316,23 +354,7 @@ static void *from_tun(void *hc) {
 			memcpy(&c->peer, &ra, sizeof(c->peer));
 		}
 
-		int left = dlen;
-		unsigned char *b = dbuf;
-		do {
-			int w = write(c->tunfd, b, left);
-			if (w == -1) {
-				perror("write error");
-				break;
-			}
-			left -= w;
-			if (!left) {
-				break;
-			}
-			b+=w;
-			pr_debug("failed to write all at once to tunnel device, probably write queue is full\n");
-			// busy loop yield
-			sched_yield();
-		} while ( (left > 0));
+		_write_all(c, c->tunfd, dbuf, dlen, std_write);
 	}
 	close(c->sofd);
 	close(c->tunfd);
@@ -351,6 +373,7 @@ static void *to_tun(void *hc) {
 	ctx *c = (ctx *)hc;
 	int fd = c->tunfd;
 	int n;
+	int netdown = 0;
 	unsigned char buf[PACKET_MAX_LEN - sizeof(c->iv) - GCM_TAG_LEN];
 	unsigned char cbuf[PACKET_MAX_LEN];
 	while ((n = read(fd, buf, sizeof(buf))) > 0) {
@@ -373,27 +396,17 @@ static void *to_tun(void *hc) {
 			pr_debug("encryption error\n");
 			continue;
 		}
-		int left = n + sizeof(c->iv) + GCM_TAG_LEN;
-		unsigned char *b = cbuf;
-		do {
-			int s = sendto(c->sofd, b, left, 0, (struct sockaddr *)&c->peer, sizeof(c->peer));
-			if (s == -1) {
-				perror("sendto error");
-				if (errno == ENETUNREACH) {
-					printf("reconfiguring routes\n");
-					setup_routes(c);
-				}
-				break;
-			}
-			left -= s;
-			if (!left) {
-				break;
-			}
-			b+=s;
-			pr_debug("failed to write all at once, probably write queue is full\n");
-			// busy loop yield
-			sched_yield();
-		} while ( (left > 0));
+		int len = n + sizeof(c->iv) + GCM_TAG_LEN;
+
+		int err = _write_all(c, c->sofd, cbuf, len, _sendto);
+		if (err == ENETUNREACH) {
+			netdown = 1; // network down
+		} else if (!err && netdown) {
+			// back online
+			netdown = 0;
+			pr_debug("network back online, reconfiguring routes\n");
+			setup_routes(c, 1);
+		}
 
 		update_iv(c);
 	}
