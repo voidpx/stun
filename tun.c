@@ -178,15 +178,9 @@ static void setup_routes(ctx *c, int reconfig) {
 		if (!reconfig) {
 			_CMD(err);
 		}
-		err = exec_cmd("ip route add %s via %s dev %s", c->vs, c->gw, c->mif);
-		if (!reconfig) {
-			_CMD(err);
-		}
+		exec_cmd("ip route add %s via %s dev %s", c->vs, c->gw, c->mif);
 		// v6
-		err = exec_cmd("ip -6 route add ::/0 dev %s metric 10", dev);
-		if (!reconfig) {
-			_CMD(err);
-		}
+		exec_cmd("ip -6 route add ::/0 dev %s metric 10", dev);
 	} else {
 		_CMD(exec_cmd("ip route add 10.0.0.0/24 dev %s", dev));
 		// v6
