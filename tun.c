@@ -99,7 +99,7 @@ typedef struct ctx {
 	char mif[IFNAMSIZ + 1];
 } ctx;
 
-static int interrupted;
+static int stop;
 
 #define _C_1(cond)\
 	do {if (cond) return -1;} while (0)
@@ -157,7 +157,7 @@ static int exec_cmd(char *fmt, ...) {
 
 void int_handler(int, siginfo_t *si, void *a) {
 	pr_debug("interrupted\n");
-	interrupted = 1;
+	stop = 1;
 }
 
 static void setup_int() {
@@ -321,7 +321,7 @@ static void *from_tun(void *hc) {
 	struct sockaddr_in ra = {0};
 	socklen_t ral = sizeof(ra);
 	while ((n = recvfrom(sfd, buf, sizeof(buf), 0, (struct sockaddr *)&ra, &ral)) >= 0) {
-		if (interrupted) {
+		if (stop) {
 			break;
 		}
 		if (n == 0) {
@@ -350,8 +350,6 @@ static void *from_tun(void *hc) {
 
 		_write_all(c, c->tunfd, dbuf, dlen, std_write);
 	}
-	close(c->sofd);
-	close(c->tunfd);
 	return NULL;
 }
 
@@ -371,7 +369,7 @@ static void *to_tun(void *hc) {
 	unsigned char buf[PACKET_MAX_LEN - sizeof(c->iv) - GCM_TAG_LEN];
 	unsigned char cbuf[PACKET_MAX_LEN];
 	while ((n = read(fd, buf, sizeof(buf))) > 0) {
-		if (interrupted) {
+		if (stop) {
 			break;
 		}
 		pr_debug("\nto tun===========================\n");
@@ -404,8 +402,6 @@ static void *to_tun(void *hc) {
 
 		update_iv(c);
 	}
-	close(c->sofd);
-	close(c->tunfd);
 	return NULL;
 }
 
@@ -525,6 +521,8 @@ static void readkey(char *keyfile, ctx *c) {
 }
 
 static void cleanup(ctx *c) {
+	close(c->sofd);
+	close(c->tunfd);
 	pr_debug("cleanup\n");
 	if (c->mode == SERVER) {
 		exec_cmd("ip6tables -t nat -D POSTROUTING -o %s -j MASQUERADE -s fc00::/120", c->mif);
@@ -538,10 +536,36 @@ static void cleanup(ctx *c) {
 	}
 }
 
+static void wait_for_stop(int port) {
+	int so = socket(PF_INET, SOCK_DGRAM, 0);
+	struct sockaddr_in addr;
+	memset(&addr, 0, sizeof(addr));
+	addr.sin_family = AF_INET;
+	addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+	addr.sin_port = htons(port);
+	if (bind(so, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+		err_exit("error binding at shutdown port");
+	}
+	int n;
+	char buf[1024];
+	struct sockaddr_in ra = {0};
+	socklen_t ral = sizeof(ra);
+	while ((n = recvfrom(so, buf, sizeof(buf), 0, (struct sockaddr *)&ra, &ral)) >= 0) {
+		if (stop) {
+			break;
+		}
+		if (!strncmp(buf, "stop", 4)) {
+			pr_debug("stop received\n");
+			stop = 1;
+			break;
+		}
+	}
+}
+
 static void start_forwarding(ctx *c) {
-	pthread_t totun;
+	pthread_t totun, fromtun;
 	pthread_create(&totun, NULL, to_tun, c);
-	from_tun(c);
+	pthread_create(&fromtun, NULL, from_tun, c);
 }
 
 int main(int argc, char **argv) {
@@ -618,6 +642,8 @@ int main(int argc, char **argv) {
 	}
 
 	start_forwarding(&context);
+
+	wait_for_stop(port + 1);
 
 	cleanup(&context);
 	return 0;

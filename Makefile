@@ -1,9 +1,12 @@
 CC = gcc
-CFLAGS = -O3 -Wall
+CFLAGS = -Wall
 
 DF=
 ifeq ($(DEBUG),1)
   DF := -DDEBUG=1
+  CFLAGS += -g
+else
+  CFLAGS += -O3
 endif
 
 all: tun
