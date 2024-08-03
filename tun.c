@@ -355,9 +355,9 @@ static void *from_tun(void *hc) {
 
 static void update_iv(ctx *c) {
 	time_t t = time(NULL);
-	long *p = (long *)c->iv;
-	*p = *p ^ (long)t;
-	int *p2 = (int *)(c->iv + 8);
+	uint64_t *p = (uint64_t *)c->iv;
+	*p = *p ^ (uint64_t)t;
+	uint32_t *p2 = (uint32_t *)(c->iv + 8);
 	*p2 = *p2 ^ (int)t;
 }
 
@@ -530,9 +530,9 @@ static void cleanup(ctx *c) {
 		exec_cmd("ip route delete 10.0.0.0/24 dev %s", c->tundev);
 		exec_cmd("ip -6 route delete fc00::/120 dev %s", c->tundev);
 	} else {
+		exec_cmd("ip route delete %s via %s dev %s", c->vs, c->gw, c->mif);
 		exec_cmd("ip route delete default via 10.0.0.2 metric 10");
 		exec_cmd("ip -6 route delete ::/0 dev %s metric 10", c->tundev);
-		exec_cmd("ip route delete %s via %s dev %s", c->vs, c->gw, c->mif);
 	}
 }
 
