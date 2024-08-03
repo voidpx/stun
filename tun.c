@@ -211,7 +211,7 @@ static void setup_dev(ctx *c) {
 
 #define err_exit(msg) do {perror(msg); exit(1);} while(0)
 
-static int start_server(int port) {
+static void start_server(ctx *c, int port) {
 	int so = socket(PF_INET, SOCK_DGRAM, 0);
 	struct sockaddr_in addr;
 	memset(&addr, 0, sizeof(addr));
@@ -221,7 +221,7 @@ static int start_server(int port) {
 	if (bind(so, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
 		err_exit("error binding");
 	}
-	return so;
+	c->sofd = so;
 }
 
 static void get_def(ctx *c) {
@@ -405,7 +405,7 @@ static void *to_tun(void *hc) {
 	return NULL;
 }
 
-static int _connect(char *server, int port, ctx *c) {
+static void _connect(char *server, int port, ctx *c) {
 	struct addrinfo ah = {0};
 	ah.ai_family = AF_INET;
 	ah.ai_socktype = SOCK_DGRAM;
@@ -422,7 +422,6 @@ static int _connect(char *server, int port, ctx *c) {
 
 	connect(so, (struct sockaddr *)&addr, sizeof(addr));
 	c->sofd = so;
-	return so;
 }
 
 static void getrandom(unsigned char *buf, int len) {
@@ -624,9 +623,7 @@ int main(int argc, char **argv) {
 	}
 	if (m == SERVER) {
 		context.tundev= dev ? dev : SDEV;
-		setup_tun(&context);
-		int sfd = start_server(port);
-		context.sofd = sfd;
+		start_server(&context, port);
 	} else {
 		if (!server) {
 			err_exit("VPN server must be provided with -s\n");
@@ -638,9 +635,9 @@ int main(int argc, char **argv) {
 		context.vs = server;
 		// connect
 		_connect(server, port, &context);
-		setup_tun(&context);
 	}
 
+	setup_tun(&context);
 	start_forwarding(&context);
 
 	wait_for_stop(port + 1);
