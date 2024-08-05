@@ -80,6 +80,8 @@ static void print_iphdr(const unsigned char *f) {
 #define pr_debug_bin(...)
 #endif
 
+#define err_exit(msg) do {perror(msg); exit(1);} while(0)
+
 enum Mode {
 	SERVER,
 	CLIENT
@@ -189,6 +191,20 @@ static void setup_routes(ctx *c, int reconfig) {
 
 }
 
+static void enable_forwarding() {
+	int fd = open("/proc/sys/net/ipv4/conf/all/forwarding", O_RDWR);
+	if (fd < 0 || write(fd, "1", 1) != 1) {
+		err_exit("error enabling ipv4 forwarding");
+	}
+	;
+	close(fd);
+	fd = open("/proc/sys/net/ipv6/conf/all/forwarding", O_RDWR);
+	if (fd < 0 || write(fd, "1", 1) != 1) {
+		err_exit("error enabling ipv6 forwarding");
+	}
+	close(fd);
+}
+
 static void setup_dev(ctx *c) {
 	char *dev = c->tundev;
 	_CMD(exec_cmd("ip link set dev %s up", dev));
@@ -199,17 +215,17 @@ static void setup_dev(ctx *c) {
 		// v6
 		_CMD(exec_cmd("ip -6 addr add fc00::2/128 dev %s", dev));
 	} else {
+		enable_forwarding();
 		_CMD(exec_cmd("ip address add 10.0.0.1/32 dev %s", dev));
 		_CMD(exec_cmd("iptables -t nat -A POSTROUTING -o %s -j MASQUERADE -s 10.0.0.0/24", c->mif));
 		// v6
 		_CMD(exec_cmd("ip -6 addr add fc00::1/128 dev %s", dev));
 		_CMD(exec_cmd("ip6tables -t nat -A POSTROUTING -o %s -j MASQUERADE -s fc00::/120", c->mif));
+
 	}
 	setup_routes(c, 0);
 	setup_int();
 }
-
-#define err_exit(msg) do {perror(msg); exit(1);} while(0)
 
 static void start_server(ctx *c, int port) {
 	int so = socket(PF_INET, SOCK_DGRAM, 0);
