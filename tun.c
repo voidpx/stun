@@ -370,11 +370,11 @@ static void *from_tun(void *hc) {
 }
 
 static void update_iv(ctx *c) {
-	time_t t = time(NULL);
+	uint32_t r = rand();
 	uint64_t *p = (uint64_t *)c->iv;
-	*p = *p ^ (uint64_t)t;
+	*p = *p ^ (uint64_t)r;
 	uint32_t *p2 = (uint32_t *)(c->iv + 8);
-	*p2 = *p2 ^ (int)t;
+	*p2 = *p2 ^ r;
 }
 
 static void *to_tun(void *hc) {
@@ -628,6 +628,7 @@ int main(int argc, char **argv) {
 	ctx context = {0};
 	readkey(kf, &context);
 	getrandom(context.iv, sizeof(context.iv));
+	srand(*(unsigned int *)&context.iv);
 
 	context.mode = m;
 	context.cipher = EVP_aes_128_gcm();
