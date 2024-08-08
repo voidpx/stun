@@ -27,6 +27,8 @@
 #include <linux/ipv6.h>
 #include <sched.h>
 #include <arpa/inet.h>
+#include <ctype.h>
+#include <sys/epoll.h>
 
 #define SDEV "stun"
 #define CDEV "ctun"
@@ -38,6 +40,10 @@
 #define GCM_TAG_LEN 16
 
 #define PACKET_MAX_LEN 1500
+
+#define MAX_CONN 10
+#define ID_LEN 4
+#define IK_LEN (ID_LEN + AES_KEY_LEN)
 
 #define MTU (1500 - 20 - GCM_TAG_LEN - GCM_IV_LEN)
 
@@ -87,31 +93,199 @@ enum Mode {
 	CLIENT
 };
 
+typedef struct hnod {
+	struct hnod *next;
+	void *key;
+	void *data;
+} hnod;
+
+typedef struct htab {
+	pthread_mutex_t lock;
+	hnod **tab;
+	size_t blen;
+	size_t size;
+	int (*hash)(void *);
+	int (*equal)(void *, void*);
+} htab;
+
+typedef struct client {
+	uint32_t id;
+	uint32_t tun_ipv4;
+	unsigned char *key;
+	time_t heartbeat;
+	struct sockaddr_in addr;
+} client;
+
 typedef struct ctx {
 	int sofd;
 	int tunfd;
 	enum Mode mode;
-	char *vs;
-	struct sockaddr_in peer;
 	const EVP_CIPHER * cipher;
 	char *tundev;
-	unsigned char key[AES_KEY_LEN];
+
+	union {
+		// for client
+		struct {
+			char *vs;
+			int port;
+			struct sockaddr_in server;
+			uint32_t tip;
+
+		};
+		// for server
+		struct {
+			htab *conns; // lookup by address
+			client *clients; // ip-to-client
+		};
+	};
+	union {
+		// client
+		struct {
+			unsigned char id[ID_LEN];
+			unsigned char key[AES_KEY_LEN];
+		};
+		// server
+		unsigned char keys[MAX_CONN * IK_LEN];
+	};
 	unsigned char iv[GCM_IV_LEN];
 	char gw[16];
 	char mif[IFNAMSIZ + 1];
 } ctx;
 
+static int addr_hash(void *key) {
+	struct sockaddr_in *a = (struct sockaddr_in *)key;
+	return (int)(a->sin_addr.s_addr ^ a->sin_port);
+}
+
+static int addr_equal(void *k1, void *k2) {
+	struct sockaddr_in *a1 = (struct sockaddr_in *)k1;
+	struct sockaddr_in *a2 = (struct sockaddr_in *)k2;
+	return a1->sin_addr.s_addr == a2->sin_addr.s_addr && a1->sin_port == a2->sin_port;
+}
+
+htab *htab_new(int buckets, int (*hash)(void*), int (*equal)(void*, void*)) {
+	assert(buckets > 0);
+	htab *h = malloc(sizeof(htab));
+	if (!h) {
+		return NULL;
+	}
+	int n = sizeof(hnod *) * buckets;
+	h->tab = malloc(n);
+	if (!h->tab) {
+		free(h);
+		return NULL;
+	}
+	memset(h->tab, 0, n);
+	h->blen = buckets;
+	h->hash = hash;
+	h->equal = equal;
+	h->size = 0;
+	pthread_mutex_init(&h->lock, NULL);
+	return h;
+}
+
+void htab_free(htab *h) {
+	for (int i = 0; i < h->blen; ++i) {
+		hnod *n = h->tab[i];
+		while (n) {
+			hnod *next = n->next;
+			free(n);
+			n = next;
+		}
+	}
+	free(h->tab);
+	free(h);
+}
+
+static hnod *hnod_new(void *key, void *value) {
+	hnod *n = malloc(sizeof(hnod));
+	if (!n) {
+		return NULL;
+	}
+	n->key = key;
+	n->data = value;
+	n->next = NULL;
+	return n;
+}
+
+void *htab_insert(htab *h, void *key, void *value) {
+	int hash = h->hash(key);
+	int i = ((size_t)hash) % h->blen;
+	hnod **ref = &h->tab[i];
+	void *ret = NULL;
+	pthread_mutex_lock(&h->lock);
+	while (*ref) {
+		hnod *n = *ref;
+		if (h->equal(key, n->key)) {
+			void *p = n->data;
+			n->data = value;
+			ret = p;
+			goto out;
+		}
+		ref = &n->next;
+	}
+	*ref = hnod_new(key, value);
+	if (!*ref) {
+		errno = ENOMEM;
+		err_exit("OOM while inserting into hash table\n");
+	}
+	h->size++;
+out:
+	pthread_mutex_unlock(&h->lock);
+	return ret;
+}
+
+void *htab_get(htab *h, void *key) {
+	size_t hash = (size_t)h->hash(key);
+	hnod *n = h->tab[hash % h->blen];
+	while (n) {
+		if (h->equal(key, n->key)) {
+			return n->data;
+		}
+		n=n->next;
+	}
+	return NULL;
+}
+
+void *htab_remove(htab *h, void *key) {
+	size_t hash = (size_t)h->hash(key);
+	hnod **ref = &h->tab[hash % h->blen];
+	pthread_mutex_lock(&h->lock);
+	hnod *n = *ref;
+	void *ret = NULL;
+	while (n) {
+		if (h->equal(key, n->key)) {
+			void *r = n->data;
+			*ref = n->next;
+			free(n);
+			h->size--;
+			ret = r;
+			goto out;
+		}
+		ref = &n->next;
+		n=*ref;
+	}
+out:
+	pthread_mutex_unlock(&h->lock);
+	return ret;
+}
+
+#define htab_foreach(h, n) \
+	for (int i = 0; i < h->blen; ++i) \
+		for (n = h->tab[i]; n; n=n->next)
+
 static int stop;
+#define STOP_BRK {stop = 1; break;}
 
 #define _C_1(cond)\
 	do {if (cond) return -1;} while (0)
 
-static int enc(ctx *c, unsigned char* iv, unsigned char *msg, size_t len, unsigned char *out) {
+static int enc(ctx *c, unsigned char* iv, unsigned char *key, unsigned char *msg, size_t len, unsigned char *out) {
 	EVP_CIPHER_CTX *ctx;
 	_C_1(!(ctx = EVP_CIPHER_CTX_new()));
 	_C_1(1!=EVP_EncryptInit_ex(ctx, c->cipher, NULL, NULL, NULL));
 	_C_1(1!=EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_SET_IVLEN, GCM_IV_LEN, NULL));
-	_C_1(1!=EVP_EncryptInit_ex(ctx, NULL, NULL, c->key, iv));
+	_C_1(1!=EVP_EncryptInit_ex(ctx, NULL, NULL, key, iv));
 	int outl;
 	int tl = 0;
 	_C_1(1!=EVP_EncryptUpdate(ctx, out, &outl, msg, len));
@@ -124,12 +298,12 @@ static int enc(ctx *c, unsigned char* iv, unsigned char *msg, size_t len, unsign
 }
 
 
-static int dec(ctx *c, unsigned char* iv, unsigned char *emsg, size_t len, unsigned char *out) {
+static int dec(ctx *c, unsigned char* iv, unsigned char *key, unsigned char *emsg, size_t len, unsigned char *out) {
 	EVP_CIPHER_CTX *ctx;
 	_C_1(!(ctx = EVP_CIPHER_CTX_new()));
 	_C_1(1 != EVP_DecryptInit_ex(ctx, c->cipher, NULL, NULL, NULL));
 	_C_1(1 != EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_SET_IVLEN, GCM_IV_LEN, NULL));
-	_C_1(1 != EVP_DecryptInit_ex(ctx, NULL, NULL, c->key, iv));
+	_C_1(1 != EVP_DecryptInit_ex(ctx, NULL, NULL, key, iv));
 	int outl;
 	_C_1(1 != EVP_DecryptUpdate(ctx, out, &outl, emsg, len - GCM_TAG_LEN));
 	int plaintext_len = outl;
@@ -183,11 +357,11 @@ static void setup_routes(ctx *c, int reconfig) {
 		exec_cmd("ip route add %s via %s dev %s", c->vs, c->gw, c->mif);
 		// v6
 		exec_cmd("ip -6 route add ::/0 dev %s metric 10", dev);
-	} else {
+	}/* else {
 		_CMD(exec_cmd("ip route add 10.0.0.0/24 dev %s", dev));
 		// v6
 		_CMD(exec_cmd("ip -6 route add fc00::/120 dev %s", dev));
-	}
+	}*/
 
 }
 
@@ -211,20 +385,20 @@ static void setup_dev(ctx *c) {
 	_CMD(exec_cmd("ip link set dev %s mtu %d", dev, MTU));
 	_CMD(exec_cmd("ip link set dev %s multicast off", dev));
 	if (c->mode == CLIENT) {
-		_CMD(exec_cmd("ip address add 10.0.0.2/32 dev %s", dev));
+		int host = ((char *)&c->tip)[3];
+		_CMD(exec_cmd("ip address add 10.0.0.%d/24 dev %s", host, dev));
 		// v6
-		_CMD(exec_cmd("ip -6 addr add fc00::2/128 dev %s", dev));
+		_CMD(exec_cmd("ip -6 addr add fc00::%d/120 dev %s", host, dev));
 	} else {
 		enable_forwarding();
-		_CMD(exec_cmd("ip address add 10.0.0.1/32 dev %s", dev));
+		_CMD(exec_cmd("ip address add 10.0.0.1/24 dev %s", dev));
 		_CMD(exec_cmd("iptables -t nat -A POSTROUTING -o %s -j MASQUERADE -s 10.0.0.0/24", c->mif));
 		// v6
-		_CMD(exec_cmd("ip -6 addr add fc00::1/128 dev %s", dev));
+		_CMD(exec_cmd("ip -6 addr add fc00::1/120 dev %s", dev));
 		_CMD(exec_cmd("ip6tables -t nat -A POSTROUTING -o %s -j MASQUERADE -s fc00::/120", c->mif));
 
 	}
 	setup_routes(c, 0);
-	setup_int();
 }
 
 static void start_server(ctx *c, int port) {
@@ -276,56 +450,142 @@ static void setup_tun(ctx* c) {
 	int r = ioctl(fd, TUNSETIFF, &req);
 
 	if (r < 0) {
-		perror("error setting up tun device");
+		err_exit("error setting up tun device");
 	}
 	setup_dev(c);
 	c->tunfd = fd;
 }
 
-static inline int check_mc(unsigned char *ip) {
+static inline int check_ip(unsigned char *ip) {
 	if (!(((ip[0] >> 4) & 15) ^ 0x4)) {
 		struct iphdr *h = (struct iphdr*)ip;
-		if (IN_MULTICAST((uint32_t)ntohl(h->daddr))) {
+		if (!IN_MULTICAST((uint32_t)ntohl(h->daddr))) {
 			return 1;
 		}
 	} else if (!(((ip[0] >> 4) & 15) ^ 0x6)) {
 		struct ipv6hdr *h = (struct ipv6hdr*)ip;
-		if (IN6_IS_ADDR_MULTICAST(&h->daddr)) {
+		if (!IN6_IS_ADDR_MULTICAST(&h->daddr)) {
 			return 1;
 		}
-	} else {
-		return 1;
 	}
 	return 0;
 }
 
-static int std_write(ctx *c, int fd, unsigned char *buf, int len) {
-	return write(fd, buf, len);
+static inline int ip_host(unsigned char *ip) {
+	if (!(((ip[0] >> 4) & 15) ^ 0x4)) {
+		struct iphdr *h = (struct iphdr*)ip;
+		return ((char*)&h->daddr)[3];
+	} else if (!(((ip[0] >> 4) & 15) ^ 0x6)) {
+		struct ipv6hdr *h = (struct ipv6hdr*)ip;
+		return ((char*)&h->daddr)[15];
+	}
+	return 0;
 }
 
-static int _sendto(ctx *c, int fd, unsigned char *buf, int len) {
-	return sendto(fd, buf, len, 0, (struct sockaddr *)&c->peer, sizeof(c->peer));
+#define write_all(wfunc, fd, buf, len, ...) \
+	({\
+		int left = len; \
+		unsigned char *b = buf; \
+		do { \
+			errno=0; \
+			int w = wfunc(fd, b, left, ##__VA_ARGS__); \
+			if (w == -1) { \
+				perror("write error"); \
+				break; \
+			} \
+			left -= w; \
+			if (!left) { \
+				break; \
+			} \
+			b+=w; \
+			pr_debug("failed to write all at once, probably write queue is full\n"); \
+			sched_yield(); \
+		} while (1); \
+		errno;\
+	})
+
+
+// server is .1, first client is .2, etc.
+static inline int h2idx(int h) {
+	return h-2;
 }
 
-static int _write_all(ctx *c, int fd, unsigned char *buf, int len,
-		int (*out)(ctx *c, int, unsigned char*, int)) {
-	int left = len;
-	unsigned char *b = buf;
-	do {
-		int w = out(c, fd, b, left);
-		if (w == -1) {
-			perror("write error");
-			return errno;
+static inline int idx2h(int i) {
+	return i+2;
+}
+
+static void tun_handshake(ctx *c, int so, struct sockaddr_in *remote, unsigned char *buf, int n) {
+	if (n <= ID_LEN + GCM_IV_LEN + GCM_TAG_LEN) {
+		pr_debug("invalid incoming connection\n");
+		return;
+	}
+	for (int i = 0; i < MAX_CONN; ++i) {
+		int ki = i * IK_LEN;
+		unsigned char *kid = buf;
+		if (!*(uint32_t *)kid) {
+			continue;
 		}
-		left -= w;
-		if (!left) {
-			return 0;
+		if (!strncmp((char *)buf, (char *)&c->keys[ki], ID_LEN)) {
+			unsigned char *iv = buf + ID_LEN;
+			unsigned char *b = iv + GCM_IV_LEN;
+			unsigned char *key = &c->keys[ki] + ID_LEN;
+			int r = n - ID_LEN - GCM_IV_LEN;
+			if (r == ID_LEN + GCM_TAG_LEN) { // new connection
+				unsigned char id[ID_LEN];
+				if (dec(c, iv, key, b, r, id)) {
+					pr_debug("key mismatch\n");
+					return;
+				}
+				if (strncmp((const char *)id, (const char *)kid, ID_LEN)) {
+					pr_debug("id mismatch\n");
+					return;
+				}
+				// allocate ip 10.0.0.0/24
+				unsigned char ip[4] = {10, 0, 0, 0};
+				for (int j = 0; j < MAX_CONN; ++j) {
+					if (!c->clients[j].id) {
+						ip[3] = (char)idx2h(j);
+						unsigned char out[4 + GCM_IV_LEN + GCM_TAG_LEN];
+						memcpy(out, c->iv, GCM_IV_LEN);
+						if (enc(c, c->iv, key, ip, sizeof(ip), out + GCM_IV_LEN)) {
+							pr_debug("error encrypting\n");
+							return;
+						}
+						write_all(sendto, so, out, sizeof(out), 0, (struct sockaddr *)remote, sizeof(*remote));
+						return;
+					}
+				}
+				break;
+			} else if (r ==  6 + GCM_TAG_LEN) { // OK + ipv4
+				unsigned char msg[6];
+				if (dec(c, iv, key, b, r, msg)) {
+					pr_debug("key mismatch\n");
+					return;
+				}
+				if (strncmp("OK", (const char *)msg, 2)) {
+					pr_debug("client not OK\n");
+					return;
+				}
+				int idx = h2idx(msg[5]);
+				c->clients[idx].id=*(uint32_t *)kid;
+				c->clients[idx].key = key;
+				c->clients[idx].addr = *remote;
+				c->clients[idx].tun_ipv4 = *(uint32_t *)&msg[2];
+				htab_insert(c->conns, &c->clients[idx].addr, &c->clients[idx]);
+				// established
+			} else {
+				pr_debug("invalid incoming connection packet\n");
+			}
+			return;
 		}
-		b+=w;
-		pr_debug("failed to write all at once to tunnel device, probably write queue is full\n");
-		// busy loop yield
-		sched_yield();
-	} while (1);
+	}
+	pr_debug("invalid id\n");
+}
+
+static void tun_fin(ctx *c, client *clt) {
+	htab_remove(c->conns, &clt->addr);
+	memset(clt, 0, sizeof(*clt));
+	pr_debug("client disconnected: %x\n", clt->tun_ipv4);
 }
 
 static void *from_tun(void *hc) {
@@ -343,28 +603,53 @@ static void *from_tun(void *hc) {
 		if (n == 0) {
 			continue;
 		}
-		// decrypt
 		if (n < sizeof(c->iv) + GCM_TAG_LEN) {
 			pr_debug("invalid packet\n");
 			continue;
 		}
+		// server side connection handling before decryption
+		unsigned char *key;
+		client *clt;
+		if (c->mode == SERVER) {
+			clt = htab_get(c->conns, &ra);
+			if (!clt) {
+handshake:
+				tun_handshake(c, sfd, &ra, buf, n);
+				continue;
+			}
+			key = clt->key;
+			clt->heartbeat = time(NULL);
+		} else {
+			key = c->key;
+		}
 		unsigned char *iv = buf;
 		unsigned char *msg = buf + sizeof(c->iv);
-		if (dec(c, iv, msg, n - sizeof(c->iv), dbuf) < 0) {
+		if (dec(c, iv, key, msg, n - sizeof(c->iv), dbuf) < 0) {
 			pr_debug("decryption error\n");
+			if (c->mode == SERVER) {
+				// client reconnecting?
+				pr_debug("client reconnecting\n");
+				htab_remove(c->conns, &ra);
+				goto handshake;
+			}
+			stop = 1;
+			break;
+		}
+		// client quit
+		if (c->mode == SERVER && !strncmp("QUIT", (const char *)dbuf, 4)) {
+			tun_fin(c, clt);
 			continue;
 		}
 		int dlen = n - sizeof(c->iv) - GCM_TAG_LEN;
+
 		pr_debug("\nfrom tun decrypted===========================\n");
 		pr_debug_iphdr(dbuf);
 		pr_debug("\nfrom tun decrypted===========================end\n");
-		if (c->mode == SERVER) {
-			pr_debug("\n peer:\n");
-			pr_debug_bin((unsigned char*)&ra, ral);
-			memcpy(&c->peer, &ra, sizeof(c->peer));
-		}
 
-		_write_all(c, c->tunfd, dbuf, dlen, std_write);
+		if (write_all(write, c->tunfd, dbuf, dlen)) {
+			pr_debug("error writing to tunnel device, stop\n");
+			STOP_BRK;
+		}
 	}
 	return NULL;
 }
@@ -377,67 +662,137 @@ static void update_iv(ctx *c) {
 	*p2 = *p2 ^ r;
 }
 
+static int enc_and_send(ctx *c,  int so, unsigned char *key, unsigned char *buf, int len, struct sockaddr *addr, socklen_t sl) {
+	assert(len <= PACKET_MAX_LEN - GCM_IV_LEN - GCM_TAG_LEN);
+	unsigned char out[PACKET_MAX_LEN];
+	memcpy(out, c->iv, sizeof(c->iv));
+	if (enc(c, c->iv, key, buf, len, out + sizeof(c->iv)) < 0) {
+		pr_debug("encryption error\n");
+		return -1;
+	}
+	update_iv(c);
+	return write_all(sendto, so, out, len + GCM_IV_LEN + GCM_TAG_LEN, 0, addr, sl);
+}
+
+// connect protocol
+static void reconnect(ctx *c) {
+	if (c->tunfd > 0) {
+		close(c->tunfd);
+		close(c->tunfd);
+	}
+	struct addrinfo ah = {0};
+	ah.ai_family = AF_INET;
+	ah.ai_socktype = SOCK_DGRAM;
+	ah.ai_protocol = 0;
+	struct addrinfo *ai;
+	if (getaddrinfo(c->vs, NULL, &ah, &ai)) {
+		err_exit("unable to resolve host");
+	}
+	int so = socket(PF_INET, SOCK_DGRAM, 0);
+	struct sockaddr_in addr = *(struct sockaddr_in*)ai->ai_addr;
+	freeaddrinfo(ai);
+	addr.sin_port = htons(c->port);
+	c->server = addr;
+
+	if (connect(so, (struct sockaddr *)&addr, sizeof(addr))) {
+		err_exit("error connecting\n");
+	}
+	c->sofd = so;
+	unsigned char *id = c->id;
+	int len = ID_LEN + ID_LEN + GCM_IV_LEN + GCM_TAG_LEN;
+	unsigned char buf[64]; // reuse buf
+	unsigned char *b = buf;
+	memcpy(b, id, ID_LEN);
+	b+= ID_LEN;
+	memcpy(b, c->iv, sizeof(c->iv));
+	b+=sizeof(c->iv);
+	if (enc(c, c->iv, c->key, id, ID_LEN, b)) {
+		err_exit("err encrypting\n");
+	}
+	if (write_all(sendto, so, buf, len, 0, (struct sockaddr *)&addr, sizeof(addr))) {
+		err_exit("unable to connect\n");
+	}
+	unsigned char resp[GCM_IV_LEN + GCM_TAG_LEN + 4];
+	struct sockaddr_in a;
+	socklen_t slen = sizeof(a);
+	int n = recvfrom(so, resp, sizeof(resp), 0, (struct sockaddr *)&a, &slen);
+	if (n <= 0) {
+		err_exit("unable to connect\n");
+	}
+	assert(n == GCM_IV_LEN + GCM_TAG_LEN + 4);
+	unsigned char dbuf[4];
+	if (dec(c, resp, c->key, resp + GCM_IV_LEN, n - GCM_IV_LEN, dbuf)) {
+		err_exit("error decrypting server response\n");
+	}
+	c->tip = *(uint32_t *)dbuf;
+
+	// client OK
+	update_iv(c);
+	b = buf+ID_LEN;
+	memcpy(b, c->iv, sizeof(c->iv));
+	b+=sizeof(c->iv);
+	unsigned char ok[6] = {[0] = 'O', [1] = 'K'};
+	memcpy(ok+2, dbuf, 4);
+	if (enc(c, c->iv, c->key, ok, sizeof(ok), b)) {
+		err_exit("err encrypting\n");
+	}
+	if (write_all(sendto, so, buf, ID_LEN + GCM_IV_LEN + sizeof(ok) + GCM_TAG_LEN, 0, (struct sockaddr *)&addr, sizeof(addr))) {
+		err_exit("unable to connect\n");
+	}
+	// connection established
+	setup_tun(c);
+
+}
+
 static void *to_tun(void *hc) {
 	ctx *c = (ctx *)hc;
 	int fd = c->tunfd;
 	int n;
 	int netdown = 0;
 	unsigned char buf[PACKET_MAX_LEN - sizeof(c->iv) - GCM_TAG_LEN];
-	unsigned char cbuf[PACKET_MAX_LEN];
 	while ((n = read(fd, buf, sizeof(buf))) > 0) {
 		if (stop) {
 			break;
 		}
+
+		if (!check_ip(buf)) {
+			pr_debug("invalid or multicast ip packet, skipped\n");
+			continue;
+		}
+
 		pr_debug("\nto tun===========================\n");
 		pr_debug_iphdr(buf);
-		if (check_mc(buf)) {
-			pr_debug("multicast ip packet skipped\n");
-			continue;
-		}
 		pr_debug("\nto tun===========================end\n");
-		if (!c->peer.sin_addr.s_addr) {
-			pr_debug("\nno peer yet, skip\n");
-			continue;
-		}
-		memcpy(cbuf, c->iv, sizeof(c->iv));
-		if (enc(c, c->iv, buf, n, cbuf + sizeof(c->iv)) < 0) {
-			pr_debug("encryption error\n");
-			continue;
-		}
-		int len = n + sizeof(c->iv) + GCM_TAG_LEN;
 
-		int err = _write_all(c, c->sofd, cbuf, len, _sendto);
-		if (err == ENETUNREACH) {
-			netdown = 1; // network down
-		} else if (!err && netdown) {
-			// back online
-			netdown = 0;
-			pr_debug("network back online, reconfiguring routes\n");
-			setup_routes(c, 1);
+		if (c->mode == SERVER) {
+			struct client *clt;
+			int host = ip_host(buf);
+			int i = h2idx(host);
+			if (i < 0 || i >= MAX_CONN || !c->clients[i].id) {
+				pr_debug("invalid host: %d\n", i);
+				continue;
+			}
+			clt = &c->clients[i];
+			if (enc_and_send(c, c->sofd, clt->key, buf, n, (struct sockaddr *)&clt->addr, sizeof(clt->addr))) {
+				tun_fin(c, clt);
+				continue;
+			}
+		} else {
+			int err = enc_and_send(c, c->sofd, c->key, buf, n, (struct sockaddr *)&c->server, sizeof(c->server));
+			if (err == ENETUNREACH) {
+				netdown = 1; // network down
+				continue;
+			} else if (!err && netdown) {
+				// back online
+				netdown = 0;
+				pr_debug("network back online, reconnect\n");
+				reconnect(c);
+			} else if (err) {
+				STOP_BRK
+			}
 		}
-
-		update_iv(c);
 	}
 	return NULL;
-}
-
-static void _connect(char *server, int port, ctx *c) {
-	struct addrinfo ah = {0};
-	ah.ai_family = AF_INET;
-	ah.ai_socktype = SOCK_DGRAM;
-	ah.ai_protocol = 0;
-	struct addrinfo *ai;
-	if (getaddrinfo(server, NULL, &ah, &ai)) {
-		err_exit("unable to resolve host");
-	}
-	int so = socket(PF_INET, SOCK_DGRAM, 0);
-	struct sockaddr_in addr = *(struct sockaddr_in*)ai->ai_addr;
-	freeaddrinfo(ai);
-	addr.sin_port = htons(port);
-	c->peer = addr;
-
-	connect(so, (struct sockaddr *)&addr, sizeof(addr));
-	c->sofd = so;
 }
 
 static void getrandom(unsigned char *buf, int len) {
@@ -465,7 +820,7 @@ static void getrandom(unsigned char *buf, int len) {
 
 #define B64C "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
 
-static void b64(unsigned char *b, int len, char *out, int *outl) {
+static int b64(unsigned char *b, int len, char *out) {
 	int i = 0;
 	int o = 0;
 	for (; i < len; i+=3) {
@@ -474,9 +829,7 @@ static void b64(unsigned char *b, int len, char *out, int *outl) {
 		out[o++] = i+1 < len ? B64C[((b[i+1]&15) << 2) | (i+2 < len ? (b[i+2] >> 6) : 0)] : '=';
 		out[o++] = i+2 < len ? B64C[(b[i+2]&63)] : '=';
 	}
-	if (outl) {
-		*outl = o;
-	}
+	return o;
 }
 
 static inline unsigned char bi(char c) {
@@ -494,56 +847,80 @@ static inline unsigned char bi(char c) {
 	assert(0);
 }
 
-static void rb64(unsigned char *b, int len, unsigned char *out) {
+static int rb64(unsigned char *b, int len, unsigned char *out) {
 	assert(len % 4 == 0);
 	int i = 0;
 	int o = 0;
 	for (; i+4 <= len; i+=4) {
 		unsigned char c1 = bi(b[i]);
 		unsigned char c2 = bi(b[i+1]);
-		unsigned char c3 = b[i+2] == '=' ? 0 : bi(b[i+2]);
-		unsigned char c4 = b[i+3] == '=' ? 0 : bi(b[i+3]);
 		out[o++] = (c1 << 2) | (c2 >> 4);
+		if (b[i+2] == '=') {
+			break;
+		}
+		unsigned char c3 = bi(b[i+2]);
 		out[o++] = ((c2 & 15) << 4) | (c3 >> 2);
+		if (b[i+3] == '=') {
+			break;
+		}
+		unsigned char c4 = bi(b[i+3]);
 		out[o++] = ((c3 & 3) << 6) | c4;
 	}
+	return o;
 }
 
 static void genkey() {
-	unsigned char key[AES_KEY_LEN];
-	getrandom(key, sizeof(key));
-	char out[30];
-	int n;
-	b64(key, AES_KEY_LEN, out, &n);
+	unsigned char rnd[ID_LEN + AES_KEY_LEN];
+	getrandom(rnd, sizeof(rnd));
+	char out[100];
+	int n = b64(rnd, ID_LEN, out);
 	out[n]='\0';
-	printf("%s", out);
-
+	printf("%s:", out);
+	n = b64(rnd+ID_LEN, AES_KEY_LEN, out);
+	out[n]='\0';
+	printf("%s\n", out);
 }
 
-static void readkey(char *keyfile, ctx *c) {
-	int fd = open(keyfile, O_RDONLY);
-	char buf[30];
-	int n;
-	if (fd < 0 || (n = read(fd, buf, sizeof(buf))) <= 0) {
-		err_exit("error reading key");
+static void readkeys(char *keyfile, ctx *c) {
+	unsigned char buf[100];
+	FILE *fp = fopen(keyfile, "r");
+	int m = c->mode == SERVER ? MAX_CONN : 1;
+	for (int i=0; i < m; ++i) {
+next:
+		if (!fgets((char *)buf, sizeof(buf), fp)) {
+			break;
+		}
+		unsigned char *p = buf;
+		while (isspace(*p)) p++;
+		if (!p[0]) {
+			goto next;
+		}
+
+		unsigned char *k = (unsigned char *)strchr((char *)p, ':');
+		if (!k) {
+			err_exit("error reading key file\n");
+		}
+		int d = k - p;
+		assert(d==8);
+		assert(rb64(p, k-p, &c->keys[i*IK_LEN]) == ID_LEN);
+		k++;
+		int n = strlen((const char *)k);
+		if (k[n-1] == '\r' || k[n-1] == '\n') {
+			n--;
+		}
+		assert(rb64(k, n, &c->keys[i*IK_LEN + ID_LEN]) == AES_KEY_LEN);
 	}
-	if (buf[n-1] == '\r' || buf[n-1] == '\n') {
-		n--;
-	}
-	assert(n == 24);
-	rb64((unsigned char *)buf, n, c->key);
-	close(fd);
+	fclose(fp);
 }
 
 static void cleanup(ctx *c) {
-	close(c->sofd);
-	close(c->tunfd);
 	pr_debug("cleanup\n");
 	if (c->mode == SERVER) {
 		exec_cmd("ip6tables -t nat -D POSTROUTING -o %s -j MASQUERADE -s fc00::/120", c->mif);
 		exec_cmd("iptables -t nat -D POSTROUTING -o %s -j MASQUERADE -s 10.0.0.0/24", c->mif);
 		exec_cmd("ip route delete 10.0.0.0/24 dev %s", c->tundev);
 		exec_cmd("ip -6 route delete fc00::/120 dev %s", c->tundev);
+		htab_free(c->conns);
 	} else {
 		exec_cmd("ip route delete %s via %s dev %s", c->vs, c->gw, c->mif);
 		exec_cmd("ip route delete default via 10.0.0.2 metric 10");
@@ -551,36 +928,85 @@ static void cleanup(ctx *c) {
 	}
 }
 
-static void wait_for_stop(int port) {
+static void wait_for_stop(ctx *c, int port) {
 	int so = socket(PF_INET, SOCK_DGRAM, 0);
 	struct sockaddr_in addr;
 	memset(&addr, 0, sizeof(addr));
 	addr.sin_family = AF_INET;
 	addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
 	addr.sin_port = htons(port);
-	if (bind(so, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+	if (bind(so, (struct sockaddr *)&addr, sizeof(addr)) == -1) {
 		err_exit("error binding at shutdown port");
 	}
-	int n;
-	char buf[1024];
-	struct sockaddr_in ra = {0};
-	socklen_t ral = sizeof(ra);
-	while ((n = recvfrom(so, buf, sizeof(buf), 0, (struct sockaddr *)&ra, &ral)) >= 0) {
+	int flags = fcntl(so, F_GETFL);
+	if (flags == -1) {
+		err_exit("error GETFL");
+	}
+	if (fcntl(so, F_SETFL, flags | O_NONBLOCK) == -1) {
+		err_exit("error setting non-block");
+	}
+	int epollfd = epoll_create1(0);
+	 if (epollfd == -1) {
+	   err_exit("error setting up epoll");
+   }
+	struct epoll_event ev = { 0 };
+	ev.events = EPOLLIN;
+	if (epoll_ctl(epollfd, EPOLL_CTL_ADD, so, &ev) == -1) {
+		err_exit("error epoll add");
+	}
+	struct epoll_event events[1];
+	int nfds;
+	while ((nfds = epoll_wait(epollfd, events, 1, 1000)) != -1) {
 		if (stop) {
 			break;
 		}
-		if (!strncmp(buf, "stop", 4)) {
-			pr_debug("stop received\n");
-			stop = 1;
-			break;
+		if (nfds == 0) {
+			continue;
+		}
+		int n;
+		char buf[1024];
+		struct sockaddr_in ra = {0};
+		socklen_t ral = sizeof(ra);
+		while ((n = recvfrom(so, buf, sizeof(buf), 0, (struct sockaddr *)&ra, &ral)) >= 0) {
+			if (n >= 4 && !strncmp(buf, "stop", 4)) {
+				pr_debug("stop received\n");
+				stop = 1;
+				break;
+			} else if (c->mode == SERVER && n>=4 && !strncmp(buf, "list", 4)) {
+				hnod *nod;
+				char *b = buf;
+				int len = 0;
+				htab_foreach(c->conns, nod) {
+					struct sockaddr_in *sa = nod->key;
+					client *clt = nod->data;
+					int s = snprintf(b, sizeof(buf) - len, "%x/%x\n", sa->sin_addr.s_addr, clt->tun_ipv4);
+					b+=s;
+					len+=s;
+				}
+				sendto(so, buf, len, 0, (struct sockaddr *)&ra, ral);
+			}
 		}
 	}
+
+	// stop
+	if (c->mode == CLIENT) {
+		enc_and_send(c, c->sofd, c->key, (unsigned char *)"QUIT", 4, (struct sockaddr *)&c->server, sizeof(c->server));
+	}
+	close(c->sofd);
+	close(c->tunfd);
 }
 
 static void start_forwarding(ctx *c) {
 	pthread_t totun, fromtun;
 	pthread_create(&totun, NULL, to_tun, c);
 	pthread_create(&fromtun, NULL, from_tun, c);
+}
+
+static void init_server_ctx(ctx *c) {
+	c->conns = htab_new(MAX_CONN, addr_hash, addr_equal);
+	int n = MAX_CONN * sizeof(client);
+	c->clients = malloc(n);
+	memset(c->clients, 0, n);
 }
 
 int main(int argc, char **argv) {
@@ -626,7 +1052,7 @@ int main(int argc, char **argv) {
 	}
 
 	ctx context = {0};
-	readkey(kf, &context);
+	readkeys(kf, &context);
 	getrandom(context.iv, sizeof(context.iv));
 	srand(*(unsigned int *)&context.iv);
 
@@ -640,7 +1066,9 @@ int main(int argc, char **argv) {
 	}
 	if (m == SERVER) {
 		context.tundev= dev ? dev : SDEV;
+		init_server_ctx(&context);
 		start_server(&context, port);
+		setup_tun(&context);
 	} else {
 		if (!server) {
 			err_exit("VPN server must be provided with -s\n");
@@ -650,15 +1078,14 @@ int main(int argc, char **argv) {
 		}
 		context.tundev= dev ? dev : CDEV;
 		context.vs = server;
+		context.port = port;
 		// connect
-		_connect(server, port, &context);
+		reconnect(&context);
 	}
-
-	setup_tun(&context);
+	setup_int();
 	start_forwarding(&context);
 
-	wait_for_stop(port + 1);
-
+	wait_for_stop(&context, port + 1);
 	cleanup(&context);
 	return 0;
 }
