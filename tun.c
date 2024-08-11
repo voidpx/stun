@@ -1096,12 +1096,13 @@ static void wait_for_stop(ctx *c, int port) {
 		while ((n = recvfrom(so, buf, sizeof(buf), 0, (struct sockaddr *)&ra, &ral)) >= 0) {
 			if (n >= 4 && !strncmp(buf, "stop", 4)) {
 				pr_debug("stop received\n");
-				break;
+				goto out;
 			} else if (c->mode == SERVER && n>=4 && !strncmp(buf, "list", 4)) {
 				dump_conns(c, so, (struct sockaddr *)&ra, ral);
 			}
 		}
 	}
+out:
 	close(epollfd);
 	// stop
 	if (c->mode == CLIENT && !c->down) {
