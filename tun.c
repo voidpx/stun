@@ -147,6 +147,10 @@ typedef struct ctx {
 		// server
 		unsigned char keys[MAX_CONN * IK_LEN];
 	};
+	size_t tin, tout;
+	pthread_t to_tun, from_tun;
+	int epollfd;
+	int down;
 	unsigned char iv[GCM_IV_LEN];
 	char gw[16];
 	char mif[IFNAMSIZ + 1];
@@ -237,14 +241,18 @@ out:
 
 void *htab_get(htab *h, void *key) {
 	size_t hash = (size_t)h->hash(key);
+	pthread_mutex_lock(&h->lock);
 	hnod *n = h->tab[hash % h->blen];
+	void *ret = NULL;
 	while (n) {
 		if (h->equal(key, n->key)) {
-			return n->data;
+			ret = n->data;
+			break;
 		}
 		n=n->next;
 	}
-	return NULL;
+	pthread_mutex_unlock(&h->lock);
+	return ret;
 }
 
 void *htab_remove(htab *h, void *key) {
@@ -271,11 +279,11 @@ out:
 }
 
 #define htab_foreach(h, n) \
+	hnod *__next;\
 	for (int i = 0; i < h->blen; ++i) \
-		for (n = h->tab[i]; n; n=n->next)
+		for (n = h->tab[i], __next=NULL; n && ((__next = n->next) || 1); n=__next)
 
 static int stop;
-#define STOP_BRK {stop = 1; break;}
 
 #define _C_1(cond)\
 	do {if (cond) return -1;} while (0)
@@ -350,19 +358,15 @@ static void setup_int() {
 static void setup_routes(ctx *c, int reconfig) {
 	char *dev = c->tundev;
 	if (c->mode == CLIENT) {
-		int err = exec_cmd("ip route add default via 10.0.0.2 dev %s metric 10", dev);
+		char *ip = (char *)&c->tip;
+		int err = exec_cmd("ip route add default via 10.0.0.%d dev %s metric 10", ip[3], dev);
 		if (!reconfig) {
 			_CMD(err);
 		}
 		exec_cmd("ip route add %s via %s dev %s", c->vs, c->gw, c->mif);
 		// v6
 		exec_cmd("ip -6 route add ::/0 dev %s metric 10", dev);
-	}/* else {
-		_CMD(exec_cmd("ip route add 10.0.0.0/24 dev %s", dev));
-		// v6
-		_CMD(exec_cmd("ip -6 route add fc00::/120 dev %s", dev));
-	}*/
-
+	}
 }
 
 static void enable_forwarding() {
@@ -401,16 +405,21 @@ static void setup_dev(ctx *c) {
 	setup_routes(c, 0);
 }
 
-static void start_server(ctx *c, int port) {
+static int bind_newsk(int port, in_addr_t a) {
 	int so = socket(PF_INET, SOCK_DGRAM, 0);
 	struct sockaddr_in addr;
 	memset(&addr, 0, sizeof(addr));
 	addr.sin_family = AF_INET;
-	addr.sin_addr.s_addr = INADDR_ANY;
+	addr.sin_addr.s_addr = a;
 	addr.sin_port = htons(port);
-	if (bind(so, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
-		err_exit("error binding");
+	if (bind(so, (struct sockaddr *)&addr, sizeof(addr)) == -1) {
+		err_exit("error bind");
 	}
+	return so;
+}
+
+static inline void start_server(ctx *c, int port) {
+	int so = bind_newsk(port, INADDR_ANY);
 	c->sofd = so;
 }
 
@@ -514,6 +523,90 @@ static inline int idx2h(int i) {
 	return i+2;
 }
 
+static inline int create_epollfd() {
+	int epollfd = epoll_create1(0);
+	if (epollfd == -1) {
+		err_exit("error creating epollfd");
+	}
+	return epollfd;
+}
+
+static inline void epoll_add(int epollfd, int fd) {
+	struct epoll_event ev = { 0 };
+	ev.events = EPOLLIN;
+	if (epoll_ctl(epollfd, EPOLL_CTL_ADD, fd, &ev) == -1) {
+		err_exit("error epoll add");
+	}
+}
+
+static inline void epoll_del(int epollfd, int fd) {
+	if (epoll_ctl(epollfd, EPOLL_CTL_DEL, fd, NULL) == -1) {
+		err_exit("error epoll add");
+	}
+}
+
+static inline int _epoll_wait(int epollfd, int timeout) {
+	struct epoll_event events[1];
+	int nfds;
+	if ((nfds = epoll_wait(epollfd, events, 1, timeout)) == -1) {
+		perror("error epoll_wait");
+	}
+	return nfds;
+}
+
+static inline void set_nonblock(int fd) {
+	int flags = fcntl(fd, F_GETFL);
+	if (flags == -1) {
+		err_exit("error GETFL");
+	}
+	if (fcntl(fd, F_SETFL, flags | O_NONBLOCK) == -1) {
+		err_exit("error setting non-block");
+	}
+}
+
+static inline void set_block(int fd) {
+	int flags = fcntl(fd, F_GETFL);
+	if (flags == -1) {
+		err_exit("error GETFL");
+	}
+	if (fcntl(fd, F_SETFL, flags & ~O_NONBLOCK) == -1) {
+		err_exit("error setting non-block");
+	}
+}
+
+static void update_iv(ctx *c) {
+	uint32_t r = rand();
+	uint64_t *p = (uint64_t *)c->iv;
+	*p = *p ^ (uint64_t)r;
+	uint32_t *p2 = (uint32_t *)(c->iv + 8);
+	*p2 = *p2 ^ r;
+}
+
+static int enc_and_send(ctx *c,  int so, unsigned char *key, unsigned char *buf, int len, struct sockaddr *addr, socklen_t sl) {
+	assert(len <= PACKET_MAX_LEN - GCM_IV_LEN - GCM_TAG_LEN);
+	unsigned char out[PACKET_MAX_LEN];
+	memcpy(out, c->iv, sizeof(c->iv));
+	if (enc(c, c->iv, key, buf, len, out + sizeof(c->iv)) < 0) {
+		pr_debug("encryption error\n");
+		return -1;
+	}
+	update_iv(c);
+	int n = len + GCM_IV_LEN + GCM_TAG_LEN;
+	c->tout+=n;
+	return write_all(sendto, so, out, n, 0, addr, sl);
+}
+
+static uint32_t check_used_ip(ctx *c, unsigned char *id) {
+	uint32_t iid = *(uint32_t *)id;
+	for (int i = 0; i < MAX_CONN; ++i) {
+		if (c->clients[i].id == iid) {
+			htab_remove(c->conns, &c->clients[i].addr);
+			return c->clients[i].tun_ipv4;
+		}
+	}
+	return 0;
+}
+
 static void tun_handshake(ctx *c, int so, struct sockaddr_in *remote, unsigned char *buf, int n) {
 	if (n <= ID_LEN + GCM_IV_LEN + GCM_TAG_LEN) {
 		pr_debug("invalid incoming connection\n");
@@ -542,20 +635,23 @@ static void tun_handshake(ctx *c, int so, struct sockaddr_in *remote, unsigned c
 				}
 				// allocate ip 10.0.0.0/24
 				unsigned char ip[4] = {10, 0, 0, 0};
-				for (int j = 0; j < MAX_CONN; ++j) {
-					if (!c->clients[j].id) {
-						ip[3] = (char)idx2h(j);
-						unsigned char out[4 + GCM_IV_LEN + GCM_TAG_LEN];
-						memcpy(out, c->iv, GCM_IV_LEN);
-						if (enc(c, c->iv, key, ip, sizeof(ip), out + GCM_IV_LEN)) {
-							pr_debug("error encrypting\n");
-							return;
+				uint32_t used = check_used_ip(c, kid);
+				if (used) {
+					ip[3] = ((char *)&used)[3];
+				} else {
+					for (int j = 0; j < MAX_CONN; ++j) {
+						if (!c->clients[j].id) {
+							ip[3] = (char)idx2h(j);
+							goto ip_allocated;
 						}
-						write_all(sendto, so, out, sizeof(out), 0, (struct sockaddr *)remote, sizeof(*remote));
-						return;
 					}
+					break;
 				}
-				break;
+ip_allocated:
+				if (enc_and_send(c, so, key, ip, sizeof(ip), (struct sockaddr *)remote, sizeof(*remote))) {
+					pr_debug("error sending data\n");
+				}
+				return;
 			} else if (r ==  6 + GCM_TAG_LEN) { // OK + ipv4
 				unsigned char msg[6];
 				if (dec(c, iv, key, b, r, msg)) {
@@ -571,7 +667,10 @@ static void tun_handshake(ctx *c, int so, struct sockaddr_in *remote, unsigned c
 				c->clients[idx].key = key;
 				c->clients[idx].addr = *remote;
 				c->clients[idx].tun_ipv4 = *(uint32_t *)&msg[2];
+				c->clients[idx].heartbeat = time(NULL);
 				htab_insert(c->conns, &c->clients[idx].addr, &c->clients[idx]);
+				pr_debug("client OK, id: %x, tip: %x, addr: %x, port: %x\n", c->clients[idx].id, c->clients[idx].tun_ipv4,
+						remote->sin_addr.s_addr, remote->sin_port);
 				// established
 			} else {
 				pr_debug("invalid incoming connection packet\n");
@@ -584,8 +683,8 @@ static void tun_handshake(ctx *c, int so, struct sockaddr_in *remote, unsigned c
 
 static void tun_fin(ctx *c, client *clt) {
 	htab_remove(c->conns, &clt->addr);
-	memset(clt, 0, sizeof(*clt));
 	pr_debug("client disconnected: %x\n", clt->tun_ipv4);
+	memset(clt, 0, sizeof(*clt));
 }
 
 static void *from_tun(void *hc) {
@@ -597,12 +696,10 @@ static void *from_tun(void *hc) {
 	struct sockaddr_in ra = {0};
 	socklen_t ral = sizeof(ra);
 	while ((n = recvfrom(sfd, buf, sizeof(buf), 0, (struct sockaddr *)&ra, &ral)) >= 0) {
-		if (stop) {
-			break;
-		}
 		if (n == 0) {
 			continue;
 		}
+		c->tin+=n;
 		if (n < sizeof(c->iv) + GCM_TAG_LEN) {
 			pr_debug("invalid packet\n");
 			continue;
@@ -630,9 +727,9 @@ handshake:
 				// client reconnecting?
 				pr_debug("client reconnecting\n");
 				htab_remove(c->conns, &ra);
+				memset(clt, 0, sizeof(*clt));
 				goto handshake;
 			}
-			stop = 1;
 			break;
 		}
 		// client quit
@@ -640,46 +737,69 @@ handshake:
 			tun_fin(c, clt);
 			continue;
 		}
-		int dlen = n - sizeof(c->iv) - GCM_TAG_LEN;
-
+		
 		pr_debug("\nfrom tun decrypted===========================\n");
 		pr_debug_iphdr(dbuf);
 		pr_debug("\nfrom tun decrypted===========================end\n");
-
+		
+		int dlen = n - sizeof(c->iv) - GCM_TAG_LEN;
 		if (write_all(write, c->tunfd, dbuf, dlen)) {
-			pr_debug("error writing to tunnel device, stop\n");
-			STOP_BRK;
+			pr_debug("error writing to tunnel device\n");
+			break;
 		}
 	}
+	c->down = 1;
 	return NULL;
 }
 
-static void update_iv(ctx *c) {
-	uint32_t r = rand();
-	uint64_t *p = (uint64_t *)c->iv;
-	*p = *p ^ (uint64_t)r;
-	uint32_t *p2 = (uint32_t *)(c->iv + 8);
-	*p2 = *p2 ^ r;
+static void *to_tun(void *hc) {
+	ctx *c = (ctx *)hc;
+	int fd = c->tunfd;
+	int n;
+	unsigned char buf[PACKET_MAX_LEN - sizeof(c->iv) - GCM_TAG_LEN];
+	while ((n = read(fd, buf, sizeof(buf))) > 0) {
+		if (!check_ip(buf)) {
+			pr_debug("invalid or multicast ip packet, skipped\n");
+			continue;
+		}
+		
+		pr_debug("\nto tun===========================\n");
+		pr_debug_iphdr(buf);
+		pr_debug("\nto tun===========================end\n");
+		
+		unsigned char *key;
+		struct sockaddr_in *to;
+		if (c->mode == SERVER) {
+			struct client *clt;
+			int host = ip_host(buf);
+			int i = h2idx(host);
+			if (i < 0 || i >= MAX_CONN || !c->clients[i].id) {
+				pr_debug("invalid host: %d, probably disconnected already\n", i);
+				continue;
+			}
+			clt = &c->clients[i];
+			key = clt->key;
+			to = &clt->addr;
+		} else {
+			key = c->key;
+			to = &c->server;
+		}
+		if (enc_and_send(c, c->sofd, key, buf, n, (struct sockaddr *)to, sizeof(*to))) {
+			break;
+		}
+	}
+	c->down = 1;
+	return NULL;
 }
 
-static int enc_and_send(ctx *c,  int so, unsigned char *key, unsigned char *buf, int len, struct sockaddr *addr, socklen_t sl) {
-	assert(len <= PACKET_MAX_LEN - GCM_IV_LEN - GCM_TAG_LEN);
-	unsigned char out[PACKET_MAX_LEN];
-	memcpy(out, c->iv, sizeof(c->iv));
-	if (enc(c, c->iv, key, buf, len, out + sizeof(c->iv)) < 0) {
-		pr_debug("encryption error\n");
-		return -1;
-	}
-	update_iv(c);
-	return write_all(sendto, so, out, len + GCM_IV_LEN + GCM_TAG_LEN, 0, addr, sl);
+static void start_forwarding(ctx *c) {
+	c->down = 0;
+	pthread_create(&c->to_tun, NULL, to_tun, c);
+	pthread_create(&c->from_tun, NULL, from_tun, c);
 }
 
-// connect protocol
-static void reconnect(ctx *c) {
-	if (c->tunfd > 0) {
-		close(c->tunfd);
-		close(c->tunfd);
-	}
+// client connect protocol
+static void _connect(ctx *c) {
 	struct addrinfo ah = {0};
 	ah.ai_family = AF_INET;
 	ah.ai_socktype = SOCK_DGRAM;
@@ -695,12 +815,17 @@ static void reconnect(ctx *c) {
 	c->server = addr;
 
 	if (connect(so, (struct sockaddr *)&addr, sizeof(addr))) {
-		err_exit("error connecting\n");
+		err_exit("error connect\n");
 	}
 	c->sofd = so;
+	set_nonblock(so);
+	int epollfd = create_epollfd();
+	epoll_add(epollfd, so);
+
 	unsigned char *id = c->id;
 	int len = ID_LEN + ID_LEN + GCM_IV_LEN + GCM_TAG_LEN;
 	unsigned char buf[64]; // reuse buf
+	// 1 step, authenticate
 	unsigned char *b = buf;
 	memcpy(b, id, ID_LEN);
 	b+= ID_LEN;
@@ -709,15 +834,26 @@ static void reconnect(ctx *c) {
 	if (enc(c, c->iv, c->key, id, ID_LEN, b)) {
 		err_exit("err encrypting\n");
 	}
-	if (write_all(sendto, so, buf, len, 0, (struct sockaddr *)&addr, sizeof(addr))) {
-		err_exit("unable to connect\n");
+	for (int i = 0;; ++i) {
+		pr_debug("connect %d\n", i);
+		if (write_all(sendto, so, buf, len, 0, (struct sockaddr *)&addr, sizeof(addr))) {
+			err_exit("unable to connect\n");
+		}
+		if (_epoll_wait(epollfd, (i+1) * 2 * 1000) > 0) {
+			break;
+		}
+		if (i == 2) {
+			fprintf(stderr, "unable to connect: peer not responding\n");
+			exit(1);
+		}
 	}
-	unsigned char resp[GCM_IV_LEN + GCM_TAG_LEN + 4];
 	struct sockaddr_in a;
 	socklen_t slen = sizeof(a);
+	unsigned char resp[GCM_IV_LEN + GCM_TAG_LEN + 4];
 	int n = recvfrom(so, resp, sizeof(resp), 0, (struct sockaddr *)&a, &slen);
 	if (n <= 0) {
-		err_exit("unable to connect\n");
+		pr_debug("unable to connect\n");
+		exit(1);
 	}
 	assert(n == GCM_IV_LEN + GCM_TAG_LEN + 4);
 	unsigned char dbuf[4];
@@ -739,61 +875,20 @@ static void reconnect(ctx *c) {
 	if (write_all(sendto, so, buf, ID_LEN + GCM_IV_LEN + sizeof(ok) + GCM_TAG_LEN, 0, (struct sockaddr *)&addr, sizeof(addr))) {
 		err_exit("unable to connect\n");
 	}
-	// connection established
+
+	epoll_del(epollfd, so);
+	close(epollfd);
+	// connection established, switch to blocking mode
+	set_block(so);
 	setup_tun(c);
 
+	start_forwarding(c);
 }
 
-static void *to_tun(void *hc) {
-	ctx *c = (ctx *)hc;
-	int fd = c->tunfd;
-	int n;
-	int netdown = 0;
-	unsigned char buf[PACKET_MAX_LEN - sizeof(c->iv) - GCM_TAG_LEN];
-	while ((n = read(fd, buf, sizeof(buf))) > 0) {
-		if (stop) {
-			break;
-		}
-
-		if (!check_ip(buf)) {
-			pr_debug("invalid or multicast ip packet, skipped\n");
-			continue;
-		}
-
-		pr_debug("\nto tun===========================\n");
-		pr_debug_iphdr(buf);
-		pr_debug("\nto tun===========================end\n");
-
-		if (c->mode == SERVER) {
-			struct client *clt;
-			int host = ip_host(buf);
-			int i = h2idx(host);
-			if (i < 0 || i >= MAX_CONN || !c->clients[i].id) {
-				pr_debug("invalid host: %d\n", i);
-				continue;
-			}
-			clt = &c->clients[i];
-			if (enc_and_send(c, c->sofd, clt->key, buf, n, (struct sockaddr *)&clt->addr, sizeof(clt->addr))) {
-				tun_fin(c, clt);
-				continue;
-			}
-		} else {
-			int err = enc_and_send(c, c->sofd, c->key, buf, n, (struct sockaddr *)&c->server, sizeof(c->server));
-			if (err == ENETUNREACH) {
-				netdown = 1; // network down
-				continue;
-			} else if (!err && netdown) {
-				// back online
-				netdown = 0;
-				pr_debug("network back online, reconnect\n");
-				reconnect(c);
-			} else if (err) {
-				STOP_BRK
-			}
-		}
-	}
-	return NULL;
-}
+//static void reconnect(ctx *c) {
+//	pthread_t ctid;
+//	pthread_create(&ctid, NULL, (void * (*)(void *))_connect, c);
+//}
 
 static void getrandom(unsigned char *buf, int len) {
 	int fd = open("/dev/urandom", O_RDONLY);
@@ -884,6 +979,9 @@ static void genkey() {
 static void readkeys(char *keyfile, ctx *c) {
 	unsigned char buf[100];
 	FILE *fp = fopen(keyfile, "r");
+	if (!fp) {
+		err_exit("key file not found");
+	}
 	int m = c->mode == SERVER ? MAX_CONN : 1;
 	for (int i=0; i < m; ++i) {
 next:
@@ -922,44 +1020,72 @@ static void cleanup(ctx *c) {
 		exec_cmd("ip -6 route delete fc00::/120 dev %s", c->tundev);
 		htab_free(c->conns);
 	} else {
+		char *ip = (char *)&c->tip;
 		exec_cmd("ip route delete %s via %s dev %s", c->vs, c->gw, c->mif);
-		exec_cmd("ip route delete default via 10.0.0.2 metric 10");
+		exec_cmd("ip route delete default via 10.0.0.%d metric 10", ip[3]);
 		exec_cmd("ip -6 route delete ::/0 dev %s metric 10", c->tundev);
 	}
 }
 
+static void reconnect(ctx *c) {
+	pr_debug("reconnecting\n");
+	pthread_cancel(c->to_tun);
+	pthread_cancel(c->from_tun);
+	pthread_join(c->to_tun, NULL);
+	pthread_join(c->from_tun, NULL);
+	close(c->tunfd);
+	close(c->sofd);
+	cleanup(c);
+	_connect(c);
+}
+
+//static void cleanup_dead_conns(ctx *c) {
+//	hnod *nod;
+//	if (c->mode == SERVER) {
+//		time_t now = time(NULL);
+//		htab_foreach(c->conns, nod) {
+//			struct sockaddr_in *sa = nod->key;
+//			client *clt = nod->data;
+//			if (now - clt->heartbeat > 10 * 60) { // 10 min
+//				htab_remove(c->conns, sa);
+//				pr_debug("remove dead connection: %x\n", clt->tun_ipv4);
+//				memset(clt, 0, sizeof(*clt));
+//			}
+//		}
+//	}
+//}
+
+static void dump_conns(ctx *c, int so, struct sockaddr *addr, socklen_t sl) {
+	hnod *nod;
+	char buf[1024];
+	char *b = buf;
+	int len = 0;
+	htab_foreach(c->conns, nod) {
+		struct sockaddr_in *sa = nod->key;
+		client *clt = nod->data;
+		int s = snprintf(b, sizeof(buf) - len, "%x/%x\n", sa->sin_addr.s_addr, clt->tun_ipv4);
+		b+=s;
+		len+=s;
+	}
+	sendto(so, buf, len, 0, addr, sl);
+}
+
 static void wait_for_stop(ctx *c, int port) {
-	int so = socket(PF_INET, SOCK_DGRAM, 0);
-	struct sockaddr_in addr;
-	memset(&addr, 0, sizeof(addr));
-	addr.sin_family = AF_INET;
-	addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-	addr.sin_port = htons(port);
-	if (bind(so, (struct sockaddr *)&addr, sizeof(addr)) == -1) {
-		err_exit("error binding at shutdown port");
-	}
-	int flags = fcntl(so, F_GETFL);
-	if (flags == -1) {
-		err_exit("error GETFL");
-	}
-	if (fcntl(so, F_SETFL, flags | O_NONBLOCK) == -1) {
-		err_exit("error setting non-block");
-	}
-	int epollfd = epoll_create1(0);
-	 if (epollfd == -1) {
-	   err_exit("error setting up epoll");
-   }
-	struct epoll_event ev = { 0 };
-	ev.events = EPOLLIN;
-	if (epoll_ctl(epollfd, EPOLL_CTL_ADD, so, &ev) == -1) {
-		err_exit("error epoll add");
-	}
-	struct epoll_event events[1];
+	int so = bind_newsk(port, htonl(INADDR_LOOPBACK));
+	set_nonblock(so);
+	int epollfd = create_epollfd();
+	epoll_add(epollfd, so);
 	int nfds;
-	while ((nfds = epoll_wait(epollfd, events, 1, 1000)) != -1) {
+	while ((nfds = _epoll_wait(epollfd, 500)) != -1) {
 		if (stop) {
 			break;
 		}
+		if (c->mode == CLIENT && c->down) {
+			pr_debug("connection was down, reconnect\n");
+			reconnect(c);
+		}/* else {
+			cleanup_dead_conns(c);
+		}*/
 		if (nfds == 0) {
 			continue;
 		}
@@ -970,36 +1096,19 @@ static void wait_for_stop(ctx *c, int port) {
 		while ((n = recvfrom(so, buf, sizeof(buf), 0, (struct sockaddr *)&ra, &ral)) >= 0) {
 			if (n >= 4 && !strncmp(buf, "stop", 4)) {
 				pr_debug("stop received\n");
-				stop = 1;
 				break;
 			} else if (c->mode == SERVER && n>=4 && !strncmp(buf, "list", 4)) {
-				hnod *nod;
-				char *b = buf;
-				int len = 0;
-				htab_foreach(c->conns, nod) {
-					struct sockaddr_in *sa = nod->key;
-					client *clt = nod->data;
-					int s = snprintf(b, sizeof(buf) - len, "%x/%x\n", sa->sin_addr.s_addr, clt->tun_ipv4);
-					b+=s;
-					len+=s;
-				}
-				sendto(so, buf, len, 0, (struct sockaddr *)&ra, ral);
+				dump_conns(c, so, (struct sockaddr *)&ra, ral);
 			}
 		}
 	}
-
+	close(epollfd);
 	// stop
-	if (c->mode == CLIENT) {
+	if (c->mode == CLIENT && !c->down) {
 		enc_and_send(c, c->sofd, c->key, (unsigned char *)"QUIT", 4, (struct sockaddr *)&c->server, sizeof(c->server));
 	}
 	close(c->sofd);
 	close(c->tunfd);
-}
-
-static void start_forwarding(ctx *c) {
-	pthread_t totun, fromtun;
-	pthread_create(&totun, NULL, to_tun, c);
-	pthread_create(&fromtun, NULL, from_tun, c);
 }
 
 static void init_server_ctx(ctx *c) {
@@ -1017,6 +1126,7 @@ int main(int argc, char **argv) {
 	char *kf = NULL;
 	char *gw = NULL;
 	char *dev = NULL;
+	int sport = 0;
 	// poor man's arg parse
 	for (int i = 1; i < argc; i++) {
 		if (!strcmp(argv[i], "-s") && i+1 < argc) {
@@ -1025,6 +1135,9 @@ int main(int argc, char **argv) {
 			i+=1;
 		} else if (!strcmp(argv[i], "-p") && i+1 < argc) {
 			port = atoi(argv[i+1]);
+			i+=1;
+		} else if (!strcmp(argv[i], "-P") && i+1 < argc) {
+			sport = atoi(argv[i+1]);
 			i+=1;
 		} else if (!strcmp(argv[i], "-i") && i+1 < argc) {
 			mif = argv[i+1];
@@ -1045,6 +1158,10 @@ int main(int argc, char **argv) {
 			dev = argv[i+1];
 			i+=1;
 		}
+	}
+
+	if (!sport) {
+		sport = port + 1;
 	}
 
 	if (!kf) {
@@ -1069,6 +1186,7 @@ int main(int argc, char **argv) {
 		init_server_ctx(&context);
 		start_server(&context, port);
 		setup_tun(&context);
+		start_forwarding(&context);
 	} else {
 		if (!server) {
 			err_exit("VPN server must be provided with -s\n");
@@ -1080,12 +1198,11 @@ int main(int argc, char **argv) {
 		context.vs = server;
 		context.port = port;
 		// connect
-		reconnect(&context);
+		_connect(&context);
 	}
 	setup_int();
-	start_forwarding(&context);
 
-	wait_for_stop(&context, port + 1);
+	wait_for_stop(&context, sport);
 	cleanup(&context);
 	return 0;
 }
