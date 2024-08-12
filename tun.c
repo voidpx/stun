@@ -77,7 +77,7 @@ static void print_iphdr(const unsigned char *f) {
 	}
 }
 #define pr_debug_iphdr(...) print_iphdr(__VA_ARGS__)
-#define pr_debug(...) printf(__VA_ARGS__)
+#define pr_debug(...) do {printf("at %s:%d\n", __FILE__, __LINE__); printf(__VA_ARGS__);}while(0)
 #define pr_debug_bin(...) _print(__VA_ARGS__)
 
 #else
@@ -85,6 +85,9 @@ static void print_iphdr(const unsigned char *f) {
 #define pr_debug_iphdr(...)
 #define pr_debug_bin(...)
 #endif
+
+#define _perror perror
+#define perror(msg) do{printf("at %s:%d\n", __FILE__, __LINE__); _perror(msg);}while(0)
 
 #define err_exit(msg) do {perror(msg); exit(1);} while(0)
 
@@ -121,13 +124,16 @@ typedef struct ctx {
 	int tunfd;
 	enum Mode mode;
 	const EVP_CIPHER * cipher;
+	EVP_CIPHER_CTX *enc_ctx;
+	EVP_CIPHER_CTX *dec_ctx;
 	char *tundev;
 
+	// server: port to listen on, client: port of the server to connect to
+	int port;
 	union {
 		// for client
 		struct {
 			char *vs;
-			int port;
 			struct sockaddr_in server;
 			uint32_t tip;
 
@@ -289,36 +295,30 @@ static int stop;
 	do {if (cond) return -1;} while (0)
 
 static int enc(ctx *c, unsigned char* iv, unsigned char *key, unsigned char *msg, size_t len, unsigned char *out) {
-	EVP_CIPHER_CTX *ctx;
-	_C_1(!(ctx = EVP_CIPHER_CTX_new()));
-	_C_1(1!=EVP_EncryptInit_ex(ctx, c->cipher, NULL, NULL, NULL));
-	_C_1(1!=EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_SET_IVLEN, GCM_IV_LEN, NULL));
-	_C_1(1!=EVP_EncryptInit_ex(ctx, NULL, NULL, key, iv));
+	_C_1(1!=EVP_EncryptInit_ex(c->enc_ctx, c->cipher, NULL, NULL, NULL));
+	_C_1(1!=EVP_CIPHER_CTX_ctrl(c->enc_ctx, EVP_CTRL_GCM_SET_IVLEN, GCM_IV_LEN, NULL));
+	_C_1(1!=EVP_EncryptInit_ex(c->enc_ctx, NULL, NULL, key, iv));
 	int outl;
 	int tl = 0;
-	_C_1(1!=EVP_EncryptUpdate(ctx, out, &outl, msg, len));
+	_C_1(1!=EVP_EncryptUpdate(c->enc_ctx, out, &outl, msg, len));
 	tl += outl;
-	_C_1(1!=EVP_EncryptFinal_ex(ctx, out+tl, &outl));
+	_C_1(1!=EVP_EncryptFinal_ex(c->enc_ctx, out+tl, &outl));
 	tl += outl;
-	_C_1(1!=EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_GET_TAG, GCM_TAG_LEN, out+tl));
-    EVP_CIPHER_CTX_free(ctx);
+	_C_1(1!=EVP_CIPHER_CTX_ctrl(c->enc_ctx, EVP_CTRL_GCM_GET_TAG, GCM_TAG_LEN, out+tl));
     return 0;
 }
 
 
 static int dec(ctx *c, unsigned char* iv, unsigned char *key, unsigned char *emsg, size_t len, unsigned char *out) {
-	EVP_CIPHER_CTX *ctx;
-	_C_1(!(ctx = EVP_CIPHER_CTX_new()));
-	_C_1(1 != EVP_DecryptInit_ex(ctx, c->cipher, NULL, NULL, NULL));
-	_C_1(1 != EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_SET_IVLEN, GCM_IV_LEN, NULL));
-	_C_1(1 != EVP_DecryptInit_ex(ctx, NULL, NULL, key, iv));
+	_C_1(1 != EVP_DecryptInit_ex(c->dec_ctx, c->cipher, NULL, NULL, NULL));
+	_C_1(1 != EVP_CIPHER_CTX_ctrl(c->dec_ctx, EVP_CTRL_GCM_SET_IVLEN, GCM_IV_LEN, NULL));
+	_C_1(1 != EVP_DecryptInit_ex(c->dec_ctx, NULL, NULL, key, iv));
 	int outl;
-	_C_1(1 != EVP_DecryptUpdate(ctx, out, &outl, emsg, len - GCM_TAG_LEN));
+	_C_1(1 != EVP_DecryptUpdate(c->dec_ctx, out, &outl, emsg, len - GCM_TAG_LEN));
 	int plaintext_len = outl;
-	_C_1(1 != EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_SET_TAG, GCM_TAG_LEN, emsg + len - GCM_TAG_LEN));
-	_C_1(!EVP_DecryptFinal_ex(ctx, out + plaintext_len, &outl));
+	_C_1(1 != EVP_CIPHER_CTX_ctrl(c->dec_ctx, EVP_CTRL_GCM_SET_TAG, GCM_TAG_LEN, emsg + len - GCM_TAG_LEN));
+	_C_1(!EVP_DecryptFinal_ex(c->dec_ctx, out + plaintext_len, &outl));
 	plaintext_len+=outl;
-	EVP_CIPHER_CTX_free(ctx);
 	return 0;
 }
 
@@ -416,11 +416,6 @@ static int bind_newsk(int port, in_addr_t a) {
 		err_exit("error bind");
 	}
 	return so;
-}
-
-static inline void start_server(ctx *c, int port) {
-	int so = bind_newsk(port, INADDR_ANY);
-	c->sofd = so;
 }
 
 static void get_def(ctx *c) {
@@ -744,8 +739,14 @@ handshake:
 		
 		int dlen = n - sizeof(c->iv) - GCM_TAG_LEN;
 		if (write_all(write, c->tunfd, dbuf, dlen)) {
-			pr_debug("error writing to tunnel device\n");
-			break;
+			if (c->mode == SERVER) {
+				// probably client left
+				tun_fin(c, clt);
+			} else {
+				// probably server down, exit
+				pr_debug("error writing to tunnel device\n");
+				break;
+			}
 		}
 	}
 	c->down = 1;
@@ -799,7 +800,7 @@ static void start_forwarding(ctx *c) {
 }
 
 // client connect protocol
-static void _connect(ctx *c) {
+static int _connect(ctx *c) {
 	struct addrinfo ah = {0};
 	ah.ai_family = AF_INET;
 	ah.ai_socktype = SOCK_DGRAM;
@@ -815,7 +816,7 @@ static void _connect(ctx *c) {
 	c->server = addr;
 
 	if (connect(so, (struct sockaddr *)&addr, sizeof(addr))) {
-		err_exit("error connect\n");
+		goto err;
 	}
 	c->sofd = so;
 	set_nonblock(so);
@@ -837,14 +838,14 @@ static void _connect(ctx *c) {
 	for (int i = 0;; ++i) {
 		pr_debug("connect %d\n", i);
 		if (write_all(sendto, so, buf, len, 0, (struct sockaddr *)&addr, sizeof(addr))) {
-			err_exit("unable to connect\n");
+			goto err;
 		}
 		if (_epoll_wait(epollfd, (i+1) * 2 * 1000) > 0) {
 			break;
 		}
 		if (i == 2) {
-			fprintf(stderr, "unable to connect: peer not responding\n");
-			exit(1);
+			pr_debug("unable to connect: peer not responding\n");
+			goto err;
 		}
 	}
 	struct sockaddr_in a;
@@ -853,7 +854,7 @@ static void _connect(ctx *c) {
 	int n = recvfrom(so, resp, sizeof(resp), 0, (struct sockaddr *)&a, &slen);
 	if (n <= 0) {
 		pr_debug("unable to connect\n");
-		exit(1);
+		goto err;
 	}
 	assert(n == GCM_IV_LEN + GCM_TAG_LEN + 4);
 	unsigned char dbuf[4];
@@ -873,7 +874,7 @@ static void _connect(ctx *c) {
 		err_exit("err encrypting\n");
 	}
 	if (write_all(sendto, so, buf, ID_LEN + GCM_IV_LEN + sizeof(ok) + GCM_TAG_LEN, 0, (struct sockaddr *)&addr, sizeof(addr))) {
-		err_exit("unable to connect\n");
+		err_exit("unable to connect, error sending OK\n");
 	}
 
 	epoll_del(epollfd, so);
@@ -883,12 +884,10 @@ static void _connect(ctx *c) {
 	setup_tun(c);
 
 	start_forwarding(c);
+	return 0;
+err:
+	return -1;
 }
-
-//static void reconnect(ctx *c) {
-//	pthread_t ctid;
-//	pthread_create(&ctid, NULL, (void * (*)(void *))_connect, c);
-//}
 
 static void getrandom(unsigned char *buf, int len) {
 	int fd = open("/dev/urandom", O_RDONLY);
@@ -911,6 +910,7 @@ static void getrandom(unsigned char *buf, int len) {
 	"\t-g generate a key and ouput to stdout\n"\
 	"\t-n <gateway> optional, the default next hop to route the connection to vpn server\n"\
 	"\t-d <device name> optional device name\n"\
+	"\t-P <control port> port for control\n"\
 	"\n"
 
 #define B64C "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
@@ -1055,6 +1055,14 @@ static void reconnect(ctx *c) {
 //	}
 //}
 
+static int _sendto(int so, char *buf, int len, struct sockaddr *addr, socklen_t sl) {
+	int n;
+	if ((n = sendto(so, buf, len, 0, addr, sl)) == -1) {
+		perror("error sendto");
+	}
+	return n;
+}
+
 static void dump_conns(ctx *c, int so, struct sockaddr *addr, socklen_t sl) {
 	hnod *nod;
 	char buf[1024];
@@ -1067,7 +1075,7 @@ static void dump_conns(ctx *c, int so, struct sockaddr *addr, socklen_t sl) {
 		b+=s;
 		len+=s;
 	}
-	sendto(so, buf, len, 0, addr, sl);
+	_sendto(so, buf, len, addr, sl);
 }
 
 static void wait_for_stop(ctx *c, int port) {
@@ -1076,13 +1084,19 @@ static void wait_for_stop(ctx *c, int port) {
 	int epollfd = create_epollfd();
 	epoll_add(epollfd, so);
 	int nfds;
-	while ((nfds = _epoll_wait(epollfd, 500)) != -1) {
+	time_t lastreconn = time(NULL);
+	while ((nfds = _epoll_wait(epollfd, 500)) != -1 || errno == EINTR) {
 		if (stop) {
 			break;
 		}
 		if (c->mode == CLIENT && c->down) {
-			pr_debug("connection was down, reconnect\n");
-			reconnect(c);
+			time_t now = time(NULL);
+			if (now - lastreconn > 10) {
+				pr_debug("connection was down, last reconnect: %ld, now: %ld, reconnect\n", lastreconn, now);
+				reconnect(c);
+				// reconnect fail
+				lastreconn = time(NULL);
+			}
 		}/* else {
 			cleanup_dead_conns(c);
 		}*/
@@ -1099,6 +1113,9 @@ static void wait_for_stop(ctx *c, int port) {
 				goto out;
 			} else if (c->mode == SERVER && n>=4 && !strncmp(buf, "list", 4)) {
 				dump_conns(c, so, (struct sockaddr *)&ra, ral);
+			} else if (!strncmp(buf, "stat", 4)) {
+				int len = snprintf(buf, 100, "%ld/%ld\n", c->tin, c->tout);
+				_sendto(so, buf, len, (struct sockaddr *)&ra, ral);
 			}
 		}
 	}
@@ -1112,11 +1129,36 @@ out:
 	close(c->tunfd);
 }
 
+static void init_crypto(char *keyfile, ctx *c) {
+	readkeys(keyfile, c);
+	getrandom(c->iv, sizeof(c->iv));
+	srand(*(unsigned int *)c->iv);
+	c->cipher = EVP_aes_128_gcm();
+	if (!(c->enc_ctx = EVP_CIPHER_CTX_new())
+			|| !(c->dec_ctx = EVP_CIPHER_CTX_new())) {
+		pr_debug("error create cipher context\n");
+		exit(1);
+	}
+}
+
+static void uninit_crypto(ctx *c) {
+	EVP_CIPHER_free((EVP_CIPHER *)c->cipher);
+	EVP_CIPHER_CTX_free(c->enc_ctx);
+	EVP_CIPHER_CTX_free(c->dec_ctx);
+}
+
 static void init_server_ctx(ctx *c) {
 	c->conns = htab_new(MAX_CONN, addr_hash, addr_equal);
 	int n = MAX_CONN * sizeof(client);
 	c->clients = malloc(n);
 	memset(c->clients, 0, n);
+}
+
+
+static inline void start_server(ctx *c) {
+	c->sofd = bind_newsk(c->port, INADDR_ANY);
+	setup_tun(c);
+	start_forwarding(c);
 }
 
 int main(int argc, char **argv) {
@@ -1170,13 +1212,9 @@ int main(int argc, char **argv) {
 	}
 
 	ctx context = {0};
-	readkeys(kf, &context);
-	getrandom(context.iv, sizeof(context.iv));
-	srand(*(unsigned int *)&context.iv);
-
 	context.mode = m;
-	context.cipher = EVP_aes_128_gcm();
-
+	context.port = port;
+	init_crypto(kf, &context);
 	get_def(&context);
 
 	if (mif) {
@@ -1185,9 +1223,8 @@ int main(int argc, char **argv) {
 	if (m == SERVER) {
 		context.tundev= dev ? dev : SDEV;
 		init_server_ctx(&context);
-		start_server(&context, port);
-		setup_tun(&context);
-		start_forwarding(&context);
+		start_server(&context);
+
 	} else {
 		if (!server) {
 			err_exit("VPN server must be provided with -s\n");
@@ -1197,13 +1234,17 @@ int main(int argc, char **argv) {
 		}
 		context.tundev= dev ? dev : CDEV;
 		context.vs = server;
-		context.port = port;
 		// connect
-		_connect(&context);
+		if (_connect(&context)) {
+			pr_debug("unable to connect");
+			exit(1);
+		}
 	}
 	setup_int();
 
 	wait_for_stop(&context, sport);
+
+	uninit_crypto(&context);
 	cleanup(&context);
 	return 0;
 }
