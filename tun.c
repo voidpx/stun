@@ -602,6 +602,12 @@ static uint32_t check_used_ip(ctx *c, unsigned char *id) {
 	return 0;
 }
 
+static inline void tun_fin(ctx *c, client *clt) {
+	htab_remove(c->conns, &clt->addr);
+	pr_debug("client disconnected: %x\n", clt->tun_ipv4);
+	memset(clt, 0, sizeof(*clt));
+}
+
 static void tun_handshake(ctx *c, int so, struct sockaddr_in *remote, unsigned char *buf, int n) {
 	if (n <= ID_LEN + GCM_IV_LEN + GCM_TAG_LEN) {
 		pr_debug("invalid incoming connection\n");
@@ -655,8 +661,7 @@ ip_allocated:
 						remote->sin_addr.s_addr, remote->sin_port);
 				if (enc_and_send(c, so, key, ip, sizeof(ip), (struct sockaddr *)remote, sizeof(*remote))) {
 					pr_debug("error sending ip to client\n");
-					htab_remove(c->conns, &c->clients[idx].addr);
-					memset(&c->clients[idx], 0, sizeof(c->clients[idx]));
+					tun_fin(c, &c->clients[idx]);
 				}
 				return;
 				// established
@@ -667,12 +672,6 @@ ip_allocated:
 		}
 	}
 	pr_debug("invalid id\n");
-}
-
-static void tun_fin(ctx *c, client *clt) {
-	htab_remove(c->conns, &clt->addr);
-	pr_debug("client disconnected: %x\n", clt->tun_ipv4);
-	memset(clt, 0, sizeof(*clt));
 }
 
 static void *from_tun(void *hc) {
