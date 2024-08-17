@@ -643,21 +643,21 @@ static void tun_handshake(ctx *c, int so, struct sockaddr_in *remote, unsigned c
 					break;
 				}
 ip_allocated:
+				int idx = h2idx(ip[3]);
+				c->clients[idx].id=*(uint32_t *)kid;
+				c->clients[idx].key = key;
+				c->clients[idx].addr = *remote;
+				c->clients[idx].tun_ipv4 = *(uint32_t *)ip;
+				c->clients[idx].heartbeat = time(NULL);
+				htab_insert(c->conns, &c->clients[idx].addr, &c->clients[idx]);
+				pr_debug("client connected, id: %x, tip: %x, addr: %x, port: %x\n",
+						c->clients[idx].id, c->clients[idx].tun_ipv4,
+						remote->sin_addr.s_addr, remote->sin_port);
 				if (enc_and_send(c, so, key, ip, sizeof(ip), (struct sockaddr *)remote, sizeof(*remote))) {
-					pr_debug("error sending data\n");
-				} else {
-					int idx = h2idx(ip[3]);
-					c->clients[idx].id=*(uint32_t *)kid;
-					c->clients[idx].key = key;
-					c->clients[idx].addr = *remote;
-					c->clients[idx].tun_ipv4 = *(uint32_t *)ip;
-					c->clients[idx].heartbeat = time(NULL);
-					htab_insert(c->conns, &c->clients[idx].addr, &c->clients[idx]);
-					pr_debug("client connected, id: %x, tip: %x, addr: %x, port: %x\n",
-							c->clients[idx].id, c->clients[idx].tun_ipv4,
-							remote->sin_addr.s_addr, remote->sin_port);
+					pr_debug("error sending ip to client\n");
+					htab_remove(c->conns, &c->clients[idx].addr);
+					memset(&c->clients[idx], 0, sizeof(c->clients[idx]));
 				}
-
 				return;
 				// established
 			} else {
