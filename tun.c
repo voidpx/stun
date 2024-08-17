@@ -1016,6 +1016,9 @@ static void reconnect(ctx *c) {
 	close(c->tunfd);
 	close(c->sofd);
 	cleanup(c);
+
+	// retrieve the default gw again
+	get_def(c);
 	_connect(c);
 }
 
