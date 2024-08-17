@@ -645,27 +645,20 @@ static void tun_handshake(ctx *c, int so, struct sockaddr_in *remote, unsigned c
 ip_allocated:
 				if (enc_and_send(c, so, key, ip, sizeof(ip), (struct sockaddr *)remote, sizeof(*remote))) {
 					pr_debug("error sending data\n");
+				} else {
+					int idx = h2idx(ip[3]);
+					c->clients[idx].id=*(uint32_t *)kid;
+					c->clients[idx].key = key;
+					c->clients[idx].addr = *remote;
+					c->clients[idx].tun_ipv4 = *(uint32_t *)ip;
+					c->clients[idx].heartbeat = time(NULL);
+					htab_insert(c->conns, &c->clients[idx].addr, &c->clients[idx]);
+					pr_debug("client connected, id: %x, tip: %x, addr: %x, port: %x\n",
+							c->clients[idx].id, c->clients[idx].tun_ipv4,
+							remote->sin_addr.s_addr, remote->sin_port);
 				}
+
 				return;
-			} else if (r ==  6 + GCM_TAG_LEN) { // OK + ipv4
-				unsigned char msg[6];
-				if (dec(c, iv, key, b, r, msg)) {
-					pr_debug("key mismatch\n");
-					return;
-				}
-				if (strncmp("OK", (const char *)msg, 2)) {
-					pr_debug("client not OK\n");
-					return;
-				}
-				int idx = h2idx(msg[5]);
-				c->clients[idx].id=*(uint32_t *)kid;
-				c->clients[idx].key = key;
-				c->clients[idx].addr = *remote;
-				c->clients[idx].tun_ipv4 = *(uint32_t *)&msg[2];
-				c->clients[idx].heartbeat = time(NULL);
-				htab_insert(c->conns, &c->clients[idx].addr, &c->clients[idx]);
-				pr_debug("client OK, id: %x, tip: %x, addr: %x, port: %x\n", c->clients[idx].id, c->clients[idx].tun_ipv4,
-						remote->sin_addr.s_addr, remote->sin_port);
 				// established
 			} else {
 				pr_debug("invalid incoming connection packet\n");
@@ -863,19 +856,7 @@ static int _connect(ctx *c) {
 	}
 	c->tip = *(uint32_t *)dbuf;
 
-	// client OK
 	update_iv(c);
-	b = buf+ID_LEN;
-	memcpy(b, c->iv, sizeof(c->iv));
-	b+=sizeof(c->iv);
-	unsigned char ok[6] = {[0] = 'O', [1] = 'K'};
-	memcpy(ok+2, dbuf, 4);
-	if (enc(c, c->iv, c->key, ok, sizeof(ok), b)) {
-		err_exit("err encrypting\n");
-	}
-	if (write_all(sendto, so, buf, ID_LEN + GCM_IV_LEN + sizeof(ok) + GCM_TAG_LEN, 0, (struct sockaddr *)&addr, sizeof(addr))) {
-		err_exit("unable to connect, error sending OK\n");
-	}
 
 	epoll_del(epollfd, so);
 	close(epollfd);
