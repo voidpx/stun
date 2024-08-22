@@ -387,7 +387,7 @@ static void setup_dev(ctx *c) {
 	char *dev = c->tundev;
 	_CMD(exec_cmd("ip link set dev %s up", dev));
 	_CMD(exec_cmd("ip link set dev %s mtu %d", dev, MTU));
-	_CMD(exec_cmd("ip link set dev %s multicast off", dev));
+//	_CMD(exec_cmd("ip link set dev %s multicast off", dev));
 	if (c->mode == CLIENT) {
 		int host = ((char *)&c->tip)[3];
 		_CMD(exec_cmd("ip address add 10.0.0.%d/24 dev %s", host, dev));
@@ -654,7 +654,7 @@ ip_allocated:
 				c->clients[idx].key = key;
 				c->clients[idx].addr = *remote;
 				c->clients[idx].tun_ipv4 = *(uint32_t *)ip;
-				c->clients[idx].heartbeat = time(NULL);
+				//c->clients[idx].heartbeat = time(NULL);
 				htab_insert(c->conns, &c->clients[idx].addr, &c->clients[idx]);
 				pr_debug("client connected, id: %x, tip: %x, addr: %x, port: %x\n",
 						c->clients[idx].id, c->clients[idx].tun_ipv4,
@@ -702,7 +702,7 @@ handshake:
 				continue;
 			}
 			key = clt->key;
-			clt->heartbeat = time(NULL);
+			// clt->heartbeat = time(NULL);
 		} else {
 			key = c->key;
 		}
@@ -745,16 +745,27 @@ handshake:
 	return NULL;
 }
 
+static void server_multicast(ctx *c, unsigned char *buf, int len) {
+	pr_debug("server multicast\n");
+	hnod *nod;
+	htab_foreach(c->conns, nod) {
+		struct sockaddr_in *sa = nod->key;
+		client *clt = nod->data;
+		pr_debug("multicast to %x\n", clt->tun_ipv4);
+		if (enc_and_send(c, c->sofd, clt->key, buf, len, (struct sockaddr *)sa, sizeof(*sa))) {
+			pr_debug("error enc_and_send\n");
+			break;
+		}
+	}
+}
+
 static void *to_tun(void *hc) {
 	ctx *c = (ctx *)hc;
 	int fd = c->tunfd;
 	int n;
 	unsigned char buf[PACKET_MAX_LEN - sizeof(c->iv) - GCM_TAG_LEN];
 	while ((n = read(fd, buf, sizeof(buf))) > 0) {
-		if (!check_ip(buf)) {
-			pr_debug("invalid or multicast ip packet, skipped\n");
-			continue;
-		}
+		int mc = !check_ip(buf);
 		
 		pr_debug("\nto tun===========================\n");
 		pr_debug_iphdr(buf);
@@ -763,6 +774,10 @@ static void *to_tun(void *hc) {
 		unsigned char *key;
 		struct sockaddr_in *to;
 		if (c->mode == SERVER) {
+			if (mc) {
+				server_multicast(c, buf, n);
+				continue;
+			}
 			struct client *clt;
 			int host = ip_host(buf);
 			int i = h2idx(host);
