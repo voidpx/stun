@@ -76,14 +76,41 @@ static void print_iphdr(const unsigned char *f) {
 		printf("Not a ip packet\n");
 	}
 }
-#define pr_debug_iphdr(...) print_iphdr(__VA_ARGS__)
-#define pr_debug(...) do {printf("at %s:%d\n", __FILE__, __LINE__); printf(__VA_ARGS__);}while(0)
-#define pr_debug_bin(...) _print(__VA_ARGS__)
+
+static void print_time() {
+	struct timespec ts;
+	clock_gettime(CLOCK_REALTIME, &ts);
+	time_t t = (time_t)ts.tv_sec;
+	struct tm *tp = localtime(&t);
+#define LEN 28
+	char buffer[LEN];
+	strftime(buffer, LEN, "%Y-%m-%d %H:%M:%S", tp);
+	printf("%s.%ld: ", buffer, ts.tv_nsec/1000000);
+}
+
+static pthread_mutex_t debug_lock;
+
+static void debug_init() {
+	pthread_mutex_init(&debug_lock, NULL);
+}
+
+#define pr_debug_iphdr(...) do {\
+		pthread_mutex_lock(&debug_lock); \
+		print_iphdr(__VA_ARGS__); \
+		pthread_mutex_unlock(&debug_lock);}\
+	while (0)
+#define pr_debug(...) do {\
+		pthread_mutex_lock(&debug_lock); \
+		print_time(); \
+		printf("at %s:%d in %s():", __FILE__, __LINE__, __func__); \
+		printf(__VA_ARGS__); \
+		pthread_mutex_unlock(&debug_lock);}\
+	while(0)
 
 #else
 #define pr_debug(...)
 #define pr_debug_iphdr(...)
-#define pr_debug_bin(...)
+#define debug_init()
 #endif
 
 #define _perror perror
@@ -418,10 +445,11 @@ static int bind_newsk(int port, in_addr_t a) {
 	return so;
 }
 
-static void get_def(ctx *c) {
+static int get_def(ctx *c) {
 	FILE *fp = fopen("/proc/net/route", "r");
 	if (!fp) {
-		err_exit("error opening /proc/net/route");
+		pr_debug("error opening /proc/net/route");
+		return -1;
 	}
 	char line[100];
 	while (fgets(line, 100, fp)) {
@@ -441,6 +469,7 @@ static void get_def(ctx *c) {
 		}
 	}
 	fclose(fp);
+	return 0;
 }
 
 static void setup_tun(ctx* c) {
@@ -725,9 +754,9 @@ handshake:
 			continue;
 		}
 		
-		pr_debug("\nfrom tun decrypted===========================\n");
+		pr_debug("from tun decrypted===========================\n");
 		pr_debug_iphdr(dbuf);
-		pr_debug("\nfrom tun decrypted===========================end\n");
+		pr_debug("from tun decrypted===========================end\n");
 		
 		int dlen = n - sizeof(c->iv) - GCM_TAG_LEN;
 		if (write_all(write, c->tunfd, dbuf, dlen)) {
@@ -767,9 +796,9 @@ static void *to_tun(void *hc) {
 	while ((n = read(fd, buf, sizeof(buf))) > 0) {
 		int mc = !check_ip(buf);
 		
-		pr_debug("\nto tun===========================\n");
+		pr_debug("to tun===========================\n");
 		pr_debug_iphdr(buf);
-		pr_debug("\nto tun===========================end\n");
+		pr_debug("to tun===========================end\n");
 		
 		unsigned char *key;
 		struct sockaddr_in *to;
@@ -842,19 +871,20 @@ static int _connect(ctx *c) {
 	if (enc(c, c->iv, c->key, id, ID_LEN, b)) {
 		err_exit("err encrypting\n");
 	}
-	for (int i = 0;; ++i) {
+	for (int i = 0; i < 3; ++i) {
 		pr_debug("connect %d\n", i);
 		if (write_all(sendto, so, buf, len, 0, (struct sockaddr *)&addr, sizeof(addr))) {
 			goto err;
 		}
 		if (_epoll_wait(epollfd, (i+1) * 2 * 1000) > 0) {
-			break;
-		}
-		if (i == 2) {
-			pr_debug("unable to connect: peer not responding\n");
-			goto err;
+			goto gotresp;
 		}
 	}
+
+	pr_debug("unable to connect: peer not responding\n");
+	goto err;
+
+gotresp:
 	struct sockaddr_in a;
 	socklen_t slen = sizeof(a);
 	unsigned char resp[GCM_IV_LEN + GCM_TAG_LEN + 4];
@@ -866,7 +896,9 @@ static int _connect(ctx *c) {
 	assert(n == GCM_IV_LEN + GCM_TAG_LEN + 4);
 	unsigned char dbuf[4];
 	if (dec(c, resp, c->key, resp + GCM_IV_LEN, n - GCM_IV_LEN, dbuf)) {
-		err_exit("error decrypting server response\n");
+		pr_debug("error decrypting server response\n");
+		// probably other packet arrived early, skip and try next
+		goto gotresp;
 	}
 	c->tip = *(uint32_t *)dbuf;
 
@@ -1024,17 +1056,24 @@ static void cleanup(ctx *c) {
 
 static void reconnect(ctx *c) {
 	pr_debug("reconnecting\n");
-	pthread_cancel(c->to_tun);
-	pthread_cancel(c->from_tun);
-	pthread_join(c->to_tun, NULL);
-	pthread_join(c->from_tun, NULL);
-	close(c->tunfd);
-	close(c->sofd);
-	cleanup(c);
+	if (c->to_tun) {
+		pthread_cancel(c->to_tun);
+		pthread_cancel(c->from_tun);
+		pthread_join(c->to_tun, NULL);
+		pthread_join(c->from_tun, NULL);
+		c->to_tun = 0;
+		c->from_tun = 0;
+		close(c->tunfd);
+		close(c->sofd);
+		cleanup(c);
 
+	}
 	// retrieve the default gw again
-	get_def(c);
-	_connect(c);
+	if (!get_def(c)) {
+		_connect(c);
+	} else {
+		pr_debug("error retrieving default gateway");
+	}
 }
 
 //static void cleanup_dead_conns(ctx *c) {
@@ -1089,7 +1128,7 @@ static void wait_for_stop(ctx *c, int port) {
 		}
 		if (c->mode == CLIENT && c->down) {
 			time_t now = time(NULL);
-			if (now - lastreconn > 10) {
+			if (now - lastreconn > 5) {
 				pr_debug("connection was down, last reconnect: %ld, now: %ld, reconnect\n", lastreconn, now);
 				reconnect(c);
 				// reconnect fail
@@ -1201,6 +1240,8 @@ int main(int argc, char **argv) {
 		}
 	}
 
+	debug_init();
+
 	if (!sport) {
 		sport = port + 1;
 	}
@@ -1213,7 +1254,9 @@ int main(int argc, char **argv) {
 	context.mode = m;
 	context.port = port;
 	init_crypto(kf, &context);
-	get_def(&context);
+	if (get_def(&context)) {
+		err_exit("error retrieving default gateway");
+	}
 
 	if (mif) {
 		strncpy(context.mif, mif, sizeof(context.mif) - 1);
