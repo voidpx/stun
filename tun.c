@@ -29,11 +29,12 @@
 #include <arpa/inet.h>
 #include <ctype.h>
 #include <sys/epoll.h>
+#include <sys/stat.h>
 
 #define SDEV "stun"
 #define CDEV "ctun"
 
-#define PORT 8888
+#define PORT 9527
 
 #define AES_KEY_LEN 16
 #define GCM_IV_LEN 12
@@ -43,9 +44,33 @@
 
 #define MAX_CONN 10
 #define ID_LEN 4
+#define ID_SESSION_LEN 4
 #define IK_LEN (ID_LEN + AES_KEY_LEN)
 
+// protocol header: 1 byte version, 1 byte op code, 4 byte others
+#define PROTO_VERSION 0x01 // 0.1
+#define PROTO_HDR_LEN 6
+// client-->server
+#define PROTO_OP_CONNECT 'C' // connect
+#define PROTO_OP_FORWARD 'F' // forward
+#define PROTO_OP_FIN 'Q' // quit
+
 #define MTU (1500 - 20 - GCM_TAG_LEN - GCM_IV_LEN)
+
+#define LOG_FILE "/var/log/tun.log"
+
+#define LOG_MAX_SIZE (1 << 14)
+
+static char *get_time(char (*buf)[64]) {
+	struct timespec ts;
+	clock_gettime(CLOCK_REALTIME, &ts);
+	time_t t = (time_t)ts.tv_sec;
+	struct tm *tp = localtime(&t);
+	char buffer[32];
+	strftime(buffer, sizeof(buffer), "%Y-%m-%d %H:%M:%S", tp);
+	snprintf((char*)buf, sizeof(*buf), "%s.%.3ld", buffer, ts.tv_nsec/1000000);
+	return (char*)buf;
+}
 
 #ifdef DEBUG
 
@@ -78,14 +103,9 @@ static void print_iphdr(const unsigned char *f) {
 }
 
 static void print_time() {
-	struct timespec ts;
-	clock_gettime(CLOCK_REALTIME, &ts);
-	time_t t = (time_t)ts.tv_sec;
-	struct tm *tp = localtime(&t);
-#define LEN 28
-	char buffer[LEN];
-	strftime(buffer, LEN, "%Y-%m-%d %H:%M:%S", tp);
-	printf("%s.%ld: ", buffer, ts.tv_nsec/1000000);
+	char buffer[64];
+	get_time(&buffer);
+	printf("%s ", buffer);
 }
 
 static pthread_mutex_t debug_lock;
@@ -140,6 +160,7 @@ typedef struct htab {
 
 typedef struct client {
 	uint32_t id;
+	uint32_t sessionid;
 	uint32_t tun_ipv4;
 	unsigned char *key;
 	time_t heartbeat;
@@ -154,7 +175,7 @@ typedef struct ctx {
 	EVP_CIPHER_CTX *enc_ctx;
 	EVP_CIPHER_CTX *dec_ctx;
 	char *tundev;
-
+	uint32_t sessionid;
 	// server: port to listen on, client: port of the server to connect to
 	int port;
 	union {
@@ -189,15 +210,24 @@ typedef struct ctx {
 	char mif[IFNAMSIZ + 1];
 } ctx;
 
-static int addr_hash(void *key) {
-	struct sockaddr_in *a = (struct sockaddr_in *)key;
-	return (int)(a->sin_addr.s_addr ^ a->sin_port);
+//static int addr_hash(void *key) {
+//	struct sockaddr_in *a = (struct sockaddr_in *)key;
+//	return (int)(a->sin_addr.s_addr ^ a->sin_port);
+//}
+//
+//static int addr_equal(void *k1, void *k2) {
+//	struct sockaddr_in *a1 = (struct sockaddr_in *)k1;
+//	struct sockaddr_in *a2 = (struct sockaddr_in *)k2;
+//	return a1->sin_addr.s_addr == a2->sin_addr.s_addr && a1->sin_port == a2->sin_port;
+//}
+
+static int session_hash(void *key) {
+	uint32_t k = (uint32_t)key;
+	return k;
 }
 
-static int addr_equal(void *k1, void *k2) {
-	struct sockaddr_in *a1 = (struct sockaddr_in *)k1;
-	struct sockaddr_in *a2 = (struct sockaddr_in *)k2;
-	return a1->sin_addr.s_addr == a2->sin_addr.s_addr && a1->sin_port == a2->sin_port;
+static int session_equal(void *k1, void *k2) {
+	return (uint32_t)k1 == (uint32_t)k2;
 }
 
 htab *htab_new(int buckets, int (*hash)(void*), int (*equal)(void*, void*)) {
@@ -316,6 +346,64 @@ out:
 	for (int i = 0; i < h->blen; ++i) \
 		for (n = h->tab[i], __next=NULL; n && ((__next = n->next) || 1); n=__next)
 
+
+static pthread_mutex_t log_lock;
+static FILE *logfile;
+static inline void log_init() {
+	pthread_mutex_init(&log_lock, NULL);
+	logfile = fopen(LOG_FILE, "a+");
+	if (!logfile) {
+		err_exit("error opening log file: " LOG_FILE);
+	}
+}
+static inline void log_uninit() {
+	fclose(logfile);
+}
+
+static void log_rotate() {
+	struct stat st;
+	if (!stat(LOG_FILE, &st) && st.st_size > LOG_MAX_SIZE) {
+		fclose(logfile);
+		FILE *fp = fopen(LOG_FILE, "r");
+		char *buf = malloc(st.st_size);
+		if (!buf) {
+			err_exit("out of memory");
+		}
+		int n = fread(buf, 1, st.st_size, fp);
+		if (n < st.st_size) {
+			err_exit("failed to read all content of the log file: " LOG_FILE);
+		}
+		int i = 0;
+		while ((n-i) >= LOG_MAX_SIZE) {
+			while (i < st.st_size && buf[i++] != '\n');
+		}
+		fclose(fp);
+
+		if (i < st.st_size) {
+			fp = fopen(LOG_FILE, "w");
+			fwrite(buf+i, 1, (n-i), fp);
+			fclose(fp);
+		}
+		free(buf);
+		logfile = fopen(LOG_FILE, "a+");
+	}
+}
+
+static void _log(char *template, ...) {
+	pthread_mutex_lock(&log_lock);
+	log_rotate();
+	char buf[64];
+	get_time(&buf);
+	fprintf(logfile, "%s ", buf);
+	va_list va;
+	va_start(va, template);
+	vfprintf(logfile, template, va);
+	va_end(va);
+	fprintf(logfile, "\n");
+	fflush(logfile);
+	pthread_mutex_unlock(&log_lock);
+}
+
 static int stop;
 
 #define _C_1(cond)\
@@ -362,12 +450,12 @@ static int exec_cmd(char *fmt, ...) {
 		vfprintf(stderr, fmt, va2);
 		va_end(va2);
 	}
-	pr_debug("exeucting command: %s\n", cmd);
+	_log("exeucting command: %s", cmd);
 	return system(cmd);
 }
 
 void int_handler(int, siginfo_t *si, void *a) {
-	pr_debug("interrupted\n");
+	_log("interrupted");
 	stop = 1;
 }
 
@@ -413,7 +501,7 @@ static void enable_forwarding() {
 static void setup_dev(ctx *c) {
 	char *dev = c->tundev;
 	_CMD(exec_cmd("ip link set dev %s up", dev));
-	_CMD(exec_cmd("ip link set dev %s mtu %d", dev, MTU));
+	_CMD(exec_cmd("ip link set dev %s mtu %d", dev, c->mode == SERVER ? MTU : MTU-ID_SESSION_LEN));
 //	_CMD(exec_cmd("ip link set dev %s multicast off", dev));
 	if (c->mode == CLIENT) {
 		int host = ((char *)&c->tip)[3];
@@ -448,7 +536,7 @@ static int bind_newsk(int port, in_addr_t a) {
 static int get_def(ctx *c) {
 	FILE *fp = fopen("/proc/net/route", "r");
 	if (!fp) {
-		pr_debug("error opening /proc/net/route");
+		_log("error opening /proc/net/route");
 		return -1;
 	}
 	char line[100];
@@ -531,7 +619,7 @@ static inline int ip_host(unsigned char *ip) {
 				break; \
 			} \
 			b+=w; \
-			pr_debug("failed to write all at once, probably write queue is full\n"); \
+			_log("failed to write all at once, probably write queue is full\n"); \
 			sched_yield(); \
 		} while (1); \
 		errno;\
@@ -611,7 +699,7 @@ static int enc_and_send(ctx *c,  int so, unsigned char *key, unsigned char *buf,
 	unsigned char out[PACKET_MAX_LEN];
 	memcpy(out, c->iv, sizeof(c->iv));
 	if (enc(c, c->iv, key, buf, len, out + sizeof(c->iv)) < 0) {
-		pr_debug("encryption error\n");
+		_log("encryption error");
 		return -1;
 	}
 	update_iv(c);
@@ -624,24 +712,52 @@ static uint32_t check_used_ip(ctx *c, unsigned char *id) {
 	uint32_t iid = *(uint32_t *)id;
 	for (int i = 0; i < MAX_CONN; ++i) {
 		if (c->clients[i].id == iid) {
-			htab_remove(c->conns, &c->clients[i].addr);
+			htab_remove(c->conns, (void *)c->clients[i].sessionid);
 			return c->clients[i].tun_ipv4;
 		}
 	}
 	return 0;
 }
 
-static inline void tun_fin(ctx *c, client *clt) {
-	htab_remove(c->conns, &clt->addr);
-	pr_debug("client disconnected: %x\n", clt->tun_ipv4);
+static inline void tun_fin0(ctx *c, client *clt) {
+	htab_remove(c->conns, (void *)clt->sessionid);
+	_log("client disconnected: %x, session id: %x", clt->tun_ipv4, clt->sessionid);
 	memset(clt, 0, sizeof(*clt));
 }
 
-static void tun_handshake(ctx *c, int so, struct sockaddr_in *remote, unsigned char *buf, int n) {
-	if (n <= ID_LEN + GCM_IV_LEN + GCM_TAG_LEN) {
-		pr_debug("invalid incoming connection\n");
+static inline void tun_fin(ctx *c, uint32_t sessionid) {
+	client *clt = htab_get(c->conns, (void *)sessionid);
+	if (c) {
+		tun_fin0(c, clt);
+	} else {
+		_log("session not found: %x", sessionid);
+	}
+}
+
+static void client_initiated_fin(ctx *c, unsigned char *msg, int len) {
+	if (len != (PROTO_HDR_LEN + GCM_IV_LEN + GCM_TAG_LEN + 4)
+			|| msg[0] != PROTO_VERSION
+			|| msg[1] != PROTO_OP_FIN) {
+		_log("invalid FIN");
 		return;
 	}
+	uint32_t sid = *(uint32_t *)&msg[2];
+	client *clt = htab_get(c->conns, (void *)sid);
+	if (!clt) {
+		_log("FIN: client not found, sid: %x", sid);
+		return;
+	}
+	tun_fin0(c, clt);
+}
+
+static void tun_handshake(ctx *c, int so, struct sockaddr_in *remote, unsigned char *buf, int n) {
+	if (n <= PROTO_HDR_LEN + GCM_IV_LEN + GCM_TAG_LEN) {
+		_log("invalid incoming connection, addr: %x, port: %x",
+						remote->sin_addr.s_addr, remote->sin_port);
+		return;
+	}
+	buf+=2; // skip version & op
+	n-=2;
 	for (int i = 0; i < MAX_CONN; ++i) {
 		int ki = i * IK_LEN;
 		unsigned char *kid = buf;
@@ -656,11 +772,11 @@ static void tun_handshake(ctx *c, int so, struct sockaddr_in *remote, unsigned c
 			if (r == ID_LEN + GCM_TAG_LEN) { // new connection
 				unsigned char id[ID_LEN];
 				if (dec(c, iv, key, b, r, id)) {
-					pr_debug("key mismatch\n");
+					_log("key mismatch");
 					return;
 				}
 				if (strncmp((const char *)id, (const char *)kid, ID_LEN)) {
-					pr_debug("id mismatch\n");
+					_log("id mismatch");
 					return;
 				}
 				// allocate ip 10.0.0.0/24
@@ -680,27 +796,33 @@ static void tun_handshake(ctx *c, int so, struct sockaddr_in *remote, unsigned c
 ip_allocated:
 				int idx = h2idx(ip[3]);
 				c->clients[idx].id=*(uint32_t *)kid;
+				c->clients[idx].sessionid = c->sessionid++;
 				c->clients[idx].key = key;
 				c->clients[idx].addr = *remote;
 				c->clients[idx].tun_ipv4 = *(uint32_t *)ip;
 				//c->clients[idx].heartbeat = time(NULL);
-				htab_insert(c->conns, &c->clients[idx].addr, &c->clients[idx]);
-				pr_debug("client connected, id: %x, tip: %x, addr: %x, port: %x\n",
+				htab_insert(c->conns, (void *)c->clients[idx].sessionid, &c->clients[idx]);
+				_log("client connected, id: %x, tip: %x, addr: %x, port: %x, session id: %x",
 						c->clients[idx].id, c->clients[idx].tun_ipv4,
-						remote->sin_addr.s_addr, remote->sin_port);
-				if (enc_and_send(c, so, key, ip, sizeof(ip), (struct sockaddr *)remote, sizeof(*remote))) {
-					pr_debug("error sending ip to client\n");
-					tun_fin(c, &c->clients[idx]);
+						remote->sin_addr.s_addr, remote->sin_port, c->clients[idx].sessionid);
+				unsigned char out[sizeof(ip) + sizeof(c->clients[idx].sessionid)];
+				memcpy(out, ip, sizeof(ip));
+				memcpy(out + sizeof(ip), &c->clients[idx].sessionid, sizeof(c->clients[idx].sessionid));
+				if (enc_and_send(c, so, key, out, sizeof(out), (struct sockaddr *)remote, sizeof(*remote))) {
+					_log("error sending ip to client");
+					tun_fin0(c, &c->clients[idx]);
 				}
 				return;
 				// established
 			} else {
-				pr_debug("invalid incoming connection packet\n");
+				_log("invalid incoming connection packet: addr: %x, port: %x, packet_len:%d",
+						remote->sin_addr.s_addr, remote->sin_port, r);
 			}
 			return;
 		}
 	}
-	pr_debug("invalid id\n");
+	_log("invalid id, addr: %x, port: %x",
+						remote->sin_addr.s_addr, remote->sin_port);
 }
 
 static void *from_tun(void *hc) {
@@ -716,42 +838,55 @@ static void *from_tun(void *hc) {
 			continue;
 		}
 		c->tin+=n;
-		if (n < sizeof(c->iv) + GCM_TAG_LEN) {
-			pr_debug("invalid packet\n");
+		int min_len = c->mode == SERVER ? sizeof(c->iv) + GCM_TAG_LEN + PROTO_HDR_LEN : sizeof(c->iv) + GCM_TAG_LEN;
+		if (n < min_len) {
+			_log("invalid packet");
 			continue;
 		}
-		// server side connection handling before decryption
 		unsigned char *key;
-		client *clt;
+		unsigned char *iv;
+		unsigned char *msg;
+		client *clt = NULL;
 		if (c->mode == SERVER) {
-			clt = htab_get(c->conns, &ra);
-			if (!clt) {
-handshake:
-				tun_handshake(c, sfd, &ra, buf, n);
+			if (buf[0] != PROTO_VERSION) {
+				_log("invalid protocol version: %x", buf[0]);
 				continue;
 			}
+			int op = buf[1];
+			switch (op) {
+			case PROTO_OP_CONNECT:
+				tun_handshake(c, sfd, &ra, buf, n);
+				continue;
+			case PROTO_OP_FIN:
+				client_initiated_fin(c, buf, n);
+				continue;
+			default:
+				_log("unknown op code: %x", op);
+				continue;
+			case PROTO_OP_FORWARD:
+				// fallthrough
+			}
+			uint32_t sid = *(uint32_t *)&buf[2];
+			clt = htab_get(c->conns, (void *)sid);
+			if (!clt) {
+				_log("session not found: %x, ignore", sid);
+				// XXX: could have told the client to reconnect
+				continue;
+			}
+			pr_debug("recv: session: %x, client addr: %x, port: %x\n", sid, clt->addr.sin_addr.s_addr, clt->addr.sin_port);
 			key = clt->key;
-			// clt->heartbeat = time(NULL);
+			n-=PROTO_HDR_LEN;
+			iv = buf + PROTO_HDR_LEN;
+			msg = buf + PROTO_HDR_LEN + GCM_IV_LEN;
 		} else {
 			key = c->key;
+			iv = buf;
+			msg = buf + GCM_IV_LEN;
 		}
-		unsigned char *iv = buf;
-		unsigned char *msg = buf + sizeof(c->iv);
+
 		if (dec(c, iv, key, msg, n - sizeof(c->iv), dbuf) < 0) {
-			pr_debug("decryption error\n");
-			if (c->mode == SERVER) {
-				// client reconnecting?
-				pr_debug("client reconnecting\n");
-				htab_remove(c->conns, &ra);
-				memset(clt, 0, sizeof(*clt));
-				goto handshake;
-			}
+			_log("decryption error");
 			break;
-		}
-		// client quit
-		if (c->mode == SERVER && !strncmp("QUIT", (const char *)dbuf, 4)) {
-			tun_fin(c, clt);
-			continue;
 		}
 		
 		pr_debug("from tun decrypted===========================\n");
@@ -762,10 +897,10 @@ handshake:
 		if (write_all(write, c->tunfd, dbuf, dlen)) {
 			if (c->mode == SERVER) {
 				// probably client left
-				tun_fin(c, clt);
+				tun_fin0(c, clt);
 			} else {
-				// probably server down, exit
-				pr_debug("error writing to tunnel device\n");
+				// probably server down
+				_log("error writing to tunnel device");
 				break;
 			}
 		}
@@ -774,55 +909,70 @@ handshake:
 	return NULL;
 }
 
-static void server_multicast(ctx *c, unsigned char *buf, int len) {
-	pr_debug("server multicast\n");
-	hnod *nod;
-	htab_foreach(c->conns, nod) {
-		struct sockaddr_in *sa = nod->key;
-		client *clt = nod->data;
-		pr_debug("multicast to %x\n", clt->tun_ipv4);
-		if (enc_and_send(c, c->sofd, clt->key, buf, len, (struct sockaddr *)sa, sizeof(*sa))) {
-			pr_debug("error enc_and_send\n");
-			break;
-		}
-	}
-}
+//static void server_multicast(ctx *c, unsigned char *buf, int len) {
+//	pr_debug("server multicast\n");
+//	hnod *nod;
+//	htab_foreach(c->conns, nod) {
+//		struct sockaddr_in *sa = nod->key;
+//		client *clt = nod->data;
+//		pr_debug("multicast to %x\n", clt->tun_ipv4);
+//		if (enc_and_send(c, c->sofd, clt->key, buf, len, (struct sockaddr *)sa, sizeof(*sa))) {
+//			pr_debug("error enc_and_send\n");
+//			break;
+//		}
+//	}
+//}
 
 static void *to_tun(void *hc) {
 	ctx *c = (ctx *)hc;
 	int fd = c->tunfd;
 	int n;
-	unsigned char buf[PACKET_MAX_LEN - sizeof(c->iv) - GCM_TAG_LEN];
+	unsigned char buf[PACKET_MAX_LEN - sizeof(c->iv) - GCM_TAG_LEN + (c->mode == SERVER ? 0 : PROTO_HDR_LEN)];
 	while ((n = read(fd, buf, sizeof(buf))) > 0) {
-		int mc = !check_ip(buf);
+		if (!check_ip(buf)) {
+			pr_debug("multicast ignored\n");
+			continue;
+		}
 		
 		pr_debug("to tun===========================\n");
 		pr_debug_iphdr(buf);
 		pr_debug("to tun===========================end\n");
 		
-		unsigned char *key;
-		struct sockaddr_in *to;
 		if (c->mode == SERVER) {
-			if (mc) {
-				server_multicast(c, buf, n);
-				continue;
-			}
 			struct client *clt;
 			int host = ip_host(buf);
 			int i = h2idx(host);
 			if (i < 0 || i >= MAX_CONN || !c->clients[i].id) {
-				pr_debug("invalid host: %d, probably disconnected already\n", i);
+				_log("invalid host: %d, probably disconnected already", i);
 				continue;
 			}
 			clt = &c->clients[i];
-			key = clt->key;
-			to = &clt->addr;
+			unsigned char *key = clt->key;
+			struct sockaddr_in *to = &clt->addr;
+			if (enc_and_send(c, c->sofd, key, buf, n, (struct sockaddr *)to, sizeof(*to))) {
+				break;
+			}
 		} else {
-			key = c->key;
-			to = &c->server;
-		}
-		if (enc_and_send(c, c->sofd, key, buf, n, (struct sockaddr *)to, sizeof(*to))) {
-			break;
+			unsigned char out[PACKET_MAX_LEN];
+			out[0] = PROTO_VERSION;
+			out[1] = PROTO_OP_FORWARD;
+			unsigned char *outb = out+2;
+			memcpy(outb, (void *)&c->sessionid, sizeof(c->sessionid));
+			outb += sizeof(c->sessionid);
+			memcpy(outb, c->iv, sizeof(c->iv));
+			outb += sizeof(c->iv);
+
+			if (enc(c, c->iv, c->key, buf, n, outb) < 0) {
+				_log("encryption error");
+				break;
+			}
+			int len = PROTO_HDR_LEN + GCM_IV_LEN + n + GCM_TAG_LEN;
+			c->tout+=len;
+			if (write_all(sendto, c->sofd, out, len, 0, (struct sockaddr *)&c->server, sizeof(c->server))) {
+				_log("error write");
+				break;
+			}
+			update_iv(c);
 		}
 	}
 	c->down = 1;
@@ -860,10 +1010,13 @@ static int _connect(ctx *c) {
 	epoll_add(epollfd, so);
 
 	unsigned char *id = c->id;
-	int len = ID_LEN + ID_LEN + GCM_IV_LEN + GCM_TAG_LEN;
+	int len = PROTO_HDR_LEN + ID_LEN + GCM_IV_LEN + GCM_TAG_LEN;
 	unsigned char buf[64]; // reuse buf
 	// 1 step, authenticate
 	unsigned char *b = buf;
+	b[0] = PROTO_VERSION;
+	b[1] = PROTO_OP_CONNECT;
+	b+=2;
 	memcpy(b, id, ID_LEN);
 	b+= ID_LEN;
 	memcpy(b, c->iv, sizeof(c->iv));
@@ -872,7 +1025,7 @@ static int _connect(ctx *c) {
 		err_exit("err encrypting\n");
 	}
 	for (int i = 0; i < 3; ++i) {
-		pr_debug("connect %d\n", i);
+		_log("connect %d", i);
 		if (write_all(sendto, so, buf, len, 0, (struct sockaddr *)&addr, sizeof(addr))) {
 			goto err;
 		}
@@ -881,26 +1034,27 @@ static int _connect(ctx *c) {
 		}
 	}
 
-	pr_debug("unable to connect: peer not responding\n");
+	_log("unable to connect: peer not responding");
 	goto err;
 
 gotresp:
 	struct sockaddr_in a;
 	socklen_t slen = sizeof(a);
-	unsigned char resp[GCM_IV_LEN + GCM_TAG_LEN + 4];
+	unsigned char resp[GCM_IV_LEN + GCM_TAG_LEN + 4 + sizeof(c->sessionid)];
 	int n = recvfrom(so, resp, sizeof(resp), 0, (struct sockaddr *)&a, &slen);
 	if (n <= 0) {
-		pr_debug("unable to connect\n");
+		_log("unable to connect\n");
 		goto err;
 	}
-	assert(n == GCM_IV_LEN + GCM_TAG_LEN + 4);
-	unsigned char dbuf[4];
+	assert(n == sizeof(resp));
+	unsigned char dbuf[4 + sizeof(c->sessionid)];
 	if (dec(c, resp, c->key, resp + GCM_IV_LEN, n - GCM_IV_LEN, dbuf)) {
-		pr_debug("error decrypting server response\n");
-		// probably other packet arrived early, skip and try next
+		_log("error decrypting server response");
+		// probably other packet arrived early? skip and try next
 		goto gotresp;
 	}
 	c->tip = *(uint32_t *)dbuf;
+	c->sessionid = *(uint32_t *)(dbuf + 4);
 
 	update_iv(c);
 
@@ -1039,7 +1193,7 @@ next:
 }
 
 static void cleanup(ctx *c) {
-	pr_debug("cleanup\n");
+	_log("cleanup");
 	if (c->mode == SERVER) {
 		exec_cmd("ip6tables -t nat -D POSTROUTING -o %s -j MASQUERADE -s fc00::/120", c->mif);
 		exec_cmd("iptables -t nat -D POSTROUTING -o %s -j MASQUERADE -s 10.0.0.0/24", c->mif);
@@ -1055,7 +1209,7 @@ static void cleanup(ctx *c) {
 }
 
 static void reconnect(ctx *c) {
-	pr_debug("reconnecting\n");
+	_log("reconnecting");
 	if (c->to_tun) {
 		pthread_cancel(c->to_tun);
 		pthread_cancel(c->from_tun);
@@ -1072,7 +1226,7 @@ static void reconnect(ctx *c) {
 	if (!get_def(c)) {
 		_connect(c);
 	} else {
-		pr_debug("error retrieving default gateway");
+		_log("error retrieving default gateway");
 	}
 }
 
@@ -1106,13 +1260,30 @@ static void dump_conns(ctx *c, int so, struct sockaddr *addr, socklen_t sl) {
 	char *b = buf;
 	int len = 0;
 	htab_foreach(c->conns, nod) {
-		struct sockaddr_in *sa = nod->key;
+//		struct sockaddr_in *sa = nod->key;
 		client *clt = nod->data;
-		int s = snprintf(b, sizeof(buf) - len, "%x/%x\n", sa->sin_addr.s_addr, clt->tun_ipv4);
+		int s = snprintf(b, sizeof(buf) - len, "%x/%x\n", clt->addr.sin_addr.s_addr, clt->tun_ipv4);
 		b+=s;
 		len+=s;
 	}
 	_sendto(so, buf, len, addr, sl);
+}
+
+static void client_quit(ctx *c) {
+	unsigned char buf[PROTO_HDR_LEN + GCM_IV_LEN + GCM_TAG_LEN + 4];
+	buf[0] = PROTO_VERSION;
+	buf[1] = PROTO_OP_FIN;
+	*(uint32_t *)&buf[2] = c->sessionid;
+	unsigned char *b = buf+PROTO_HDR_LEN;
+	memcpy(b, c->iv, sizeof(c->iv));
+	b+=sizeof(c->iv);
+	if (enc(c, c->iv, c->key, (unsigned char *)"QUIT", 4, b) < 0) {
+		_log("encryption error");
+		return;
+	}
+	if (write_all(sendto, c->sofd, buf, sizeof(buf), 0, (struct sockaddr *)&c->server, sizeof(c->server))) {
+		_log("error write");
+	}
 }
 
 static void wait_for_stop(ctx *c, int port) {
@@ -1129,7 +1300,7 @@ static void wait_for_stop(ctx *c, int port) {
 		if (c->mode == CLIENT && c->down) {
 			time_t now = time(NULL);
 			if (now - lastreconn > 5) {
-				pr_debug("connection was down, last reconnect: %ld, now: %ld, reconnect\n", lastreconn, now);
+				_log("connection was down, last reconnect: %ld, now: %ld, reconnect", lastreconn, now);
 				reconnect(c);
 				// reconnect fail
 				lastreconn = time(NULL);
@@ -1146,7 +1317,7 @@ static void wait_for_stop(ctx *c, int port) {
 		socklen_t ral = sizeof(ra);
 		while ((n = recvfrom(so, buf, sizeof(buf), 0, (struct sockaddr *)&ra, &ral)) >= 0) {
 			if (n >= 4 && !strncmp(buf, "stop", 4)) {
-				pr_debug("stop received\n");
+				_log("stop received");
 				goto out;
 			} else if (c->mode == SERVER && n>=4 && !strncmp(buf, "list", 4)) {
 				dump_conns(c, so, (struct sockaddr *)&ra, ral);
@@ -1160,7 +1331,7 @@ out:
 	close(epollfd);
 	// stop
 	if (c->mode == CLIENT && !c->down) {
-		enc_and_send(c, c->sofd, c->key, (unsigned char *)"QUIT", 4, (struct sockaddr *)&c->server, sizeof(c->server));
+		client_quit(c);
 	}
 	close(c->sofd);
 	close(c->tunfd);
@@ -1173,8 +1344,11 @@ static void init_crypto(char *keyfile, ctx *c) {
 	c->cipher = EVP_aes_128_gcm();
 	if (!(c->enc_ctx = EVP_CIPHER_CTX_new())
 			|| !(c->dec_ctx = EVP_CIPHER_CTX_new())) {
-		pr_debug("error create cipher context\n");
+		_log("error create cipher context");
 		exit(1);
+	}
+	if (c->mode == SERVER) {
+		c->sessionid = rand();
 	}
 }
 
@@ -1185,7 +1359,7 @@ static void uninit_crypto(ctx *c) {
 }
 
 static void init_server_ctx(ctx *c) {
-	c->conns = htab_new(MAX_CONN, addr_hash, addr_equal);
+	c->conns = htab_new(MAX_CONN, session_hash, session_equal);
 	int n = MAX_CONN * sizeof(client);
 	c->clients = malloc(n);
 	memset(c->clients, 0, n);
@@ -1241,6 +1415,7 @@ int main(int argc, char **argv) {
 	}
 
 	debug_init();
+	log_init();
 
 	if (!sport) {
 		sport = port + 1;
@@ -1254,6 +1429,7 @@ int main(int argc, char **argv) {
 	context.mode = m;
 	context.port = port;
 	init_crypto(kf, &context);
+
 	if (get_def(&context)) {
 		err_exit("error retrieving default gateway");
 	}
@@ -1277,7 +1453,7 @@ int main(int argc, char **argv) {
 		context.vs = server;
 		// connect
 		if (_connect(&context)) {
-			pr_debug("unable to connect");
+			_log("unable to connect");
 			exit(1);
 		}
 	}
@@ -1287,6 +1463,7 @@ int main(int argc, char **argv) {
 
 	uninit_crypto(&context);
 	cleanup(&context);
+	log_uninit();
 	return 0;
 }
 
