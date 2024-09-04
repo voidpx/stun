@@ -30,6 +30,7 @@
 #include <ctype.h>
 #include <sys/epoll.h>
 #include <sys/stat.h>
+#include <sys/random.h>
 
 #define SDEV "stun"
 #define CDEV "ctun"
@@ -47,7 +48,7 @@
 #define ID_SESSION_LEN 4
 #define IK_LEN (ID_LEN + AES_KEY_LEN)
 
-// protocol header: 1 byte version, 1 byte op code, 4 byte others
+// protocol header: 1 byte version, 1 byte op code, 4 byte key/session id
 #define PROTO_VERSION 0x01 // 0.1
 #define PROTO_HDR_LEN 6
 // client-->server
@@ -61,7 +62,7 @@
 
 #define LOG_MAX_SIZE (1 << 14)
 
-static char *get_time(char (*buf)[64]) {
+static char __attribute__ ((unused)) *get_time(char (*buf)[64]) {
 	struct timespec ts;
 	clock_gettime(CLOCK_REALTIME, &ts);
 	time_t t = (time_t)ts.tv_sec;
@@ -188,7 +189,7 @@ typedef struct ctx {
 		};
 		// for server
 		struct {
-			htab *conns; // lookup by address
+			htab *conns; // lookup by session id
 			client *clients; // ip-to-client
 		};
 	};
@@ -209,17 +210,6 @@ typedef struct ctx {
 	char gw[16];
 	char mif[IFNAMSIZ + 1];
 } ctx;
-
-//static int addr_hash(void *key) {
-//	struct sockaddr_in *a = (struct sockaddr_in *)key;
-//	return (int)(a->sin_addr.s_addr ^ a->sin_port);
-//}
-//
-//static int addr_equal(void *k1, void *k2) {
-//	struct sockaddr_in *a1 = (struct sockaddr_in *)k1;
-//	struct sockaddr_in *a2 = (struct sockaddr_in *)k2;
-//	return a1->sin_addr.s_addr == a2->sin_addr.s_addr && a1->sin_port == a2->sin_port;
-//}
 
 static int session_hash(void *key) {
 	uint32_t k = (uint32_t)key;
@@ -346,20 +336,27 @@ out:
 	for (int i = 0; i < h->blen; ++i) \
 		for (n = h->tab[i], __next=NULL; n && ((__next = n->next) || 1); n=__next)
 
-
+#ifdef ENABLE_LOG
 static pthread_mutex_t log_lock;
 static FILE *logfile;
+#endif
+
 static inline void log_init() {
+#ifdef ENABLE_LOG
 	pthread_mutex_init(&log_lock, NULL);
 	logfile = fopen(LOG_FILE, "a+");
 	if (!logfile) {
 		err_exit("error opening log file: " LOG_FILE);
 	}
+#endif
 }
 static inline void log_uninit() {
+#ifdef ENABLE_LOG
 	fclose(logfile);
+#endif
 }
 
+#ifdef ENABLE_LOG
 static void log_rotate() {
 	struct stat st;
 	if (!stat(LOG_FILE, &st) && st.st_size > LOG_MAX_SIZE) {
@@ -388,8 +385,10 @@ static void log_rotate() {
 		logfile = fopen(LOG_FILE, "a+");
 	}
 }
+#endif
 
 static void _log(char *template, ...) {
+#ifdef ENABLE_LOG
 	pthread_mutex_lock(&log_lock);
 	log_rotate();
 	char buf[64];
@@ -402,6 +401,7 @@ static void _log(char *template, ...) {
 	fprintf(logfile, "\n");
 	fflush(logfile);
 	pthread_mutex_unlock(&log_lock);
+#endif
 }
 
 static int stop;
@@ -1071,17 +1071,6 @@ err:
 	return -1;
 }
 
-static void getrandom(unsigned char *buf, int len) {
-	int fd = open("/dev/urandom", O_RDONLY);
-	if (fd < 0) {
-		err_exit("error opening /dev/urandom");
-	}
-	if (read(fd, buf, len) < len) {
-		err_exit("error reading from /dev/urandom");
-	}
-	close(fd);
-}
-
 #define USAGE \
 	"A simple tunnel using pre-shared key for encryption\n\n"\
 	"usage:\n"\
@@ -1148,7 +1137,9 @@ static int rb64(unsigned char *b, int len, unsigned char *out) {
 
 static void genkey() {
 	unsigned char rnd[ID_LEN + AES_KEY_LEN];
-	getrandom(rnd, sizeof(rnd));
+	if (getrandom(rnd, sizeof(rnd), 0) != sizeof(rnd)) {
+		err_exit("error getrandom");
+	}
 	char out[100];
 	int n = b64(rnd, ID_LEN, out);
 	out[n]='\0';
@@ -1231,22 +1222,6 @@ static void reconnect(ctx *c) {
 	}
 }
 
-//static void cleanup_dead_conns(ctx *c) {
-//	hnod *nod;
-//	if (c->mode == SERVER) {
-//		time_t now = time(NULL);
-//		htab_foreach(c->conns, nod) {
-//			struct sockaddr_in *sa = nod->key;
-//			client *clt = nod->data;
-//			if (now - clt->heartbeat > 10 * 60) { // 10 min
-//				htab_remove(c->conns, sa);
-//				pr_debug("remove dead connection: %x\n", clt->tun_ipv4);
-//				memset(clt, 0, sizeof(*clt));
-//			}
-//		}
-//	}
-//}
-
 static int _sendto(int so, char *buf, int len, struct sockaddr *addr, socklen_t sl) {
 	int n;
 	if ((n = sendto(so, buf, len, 0, addr, sl)) == -1) {
@@ -1261,7 +1236,6 @@ static void dump_conns(ctx *c, int so, struct sockaddr *addr, socklen_t sl) {
 	char *b = buf;
 	int len = 0;
 	htab_foreach(c->conns, nod) {
-//		struct sockaddr_in *sa = nod->key;
 		client *clt = nod->data;
 		int s = snprintf(b, sizeof(buf) - len, "%x/%x\n", clt->addr.sin_addr.s_addr, clt->tun_ipv4);
 		b+=s;
@@ -1340,7 +1314,9 @@ out:
 
 static void init_crypto(char *keyfile, ctx *c) {
 	readkeys(keyfile, c);
-	getrandom(c->iv, sizeof(c->iv));
+	if (getrandom(c->iv, sizeof(c->iv), 0) != sizeof(c->iv)) {
+		err_exit("error getrandom");
+	}
 	srand(*(unsigned int *)c->iv);
 	c->cipher = EVP_aes_128_gcm();
 	if (!(c->enc_ctx = EVP_CIPHER_CTX_new())
