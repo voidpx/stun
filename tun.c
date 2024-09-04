@@ -1044,7 +1044,7 @@ gotresp:
 	unsigned char resp[GCM_IV_LEN + GCM_TAG_LEN + 4 + sizeof(c->sessionid)];
 	int n = recvfrom(so, resp, sizeof(resp), 0, (struct sockaddr *)&a, &slen);
 	if (n <= 0) {
-		_log("unable to connect\n");
+		_log("error recvfrom, probably server down");
 		goto err;
 	}
 	assert(n == sizeof(resp));
