@@ -55,7 +55,7 @@
 #define PROTO_OP_FORWARD 'F' // forward
 #define PROTO_OP_FIN 'Q' // quit
 
-#define MTU (1500 - 20 - GCM_TAG_LEN - GCM_IV_LEN)
+#define MTU (1500 - 20 - GCM_TAG_LEN - GCM_IV_LEN - 8) // max without fragmentation
 
 #define LOG_FILE "/var/log/tun.log"
 
@@ -501,7 +501,7 @@ static void enable_forwarding() {
 static void setup_dev(ctx *c) {
 	char *dev = c->tundev;
 	_CMD(exec_cmd("ip link set dev %s up", dev));
-	_CMD(exec_cmd("ip link set dev %s mtu %d", dev, c->mode == SERVER ? MTU : MTU-ID_SESSION_LEN));
+	_CMD(exec_cmd("ip link set dev %s mtu %d", dev, c->mode == SERVER ? MTU : MTU - PROTO_HDR_LEN));
 //	_CMD(exec_cmd("ip link set dev %s multicast off", dev));
 	if (c->mode == CLIENT) {
 		int host = ((char *)&c->tip)[3];
@@ -934,7 +934,7 @@ static void *to_tun(void *hc) {
 			continue;
 		}
 		
-		pr_debug("to tun===========================\n");
+		pr_debug("to tun===========================, len: %d\n", n);
 		pr_debug_iphdr(buf);
 		pr_debug("to tun===========================end\n");
 		
@@ -968,6 +968,7 @@ static void *to_tun(void *hc) {
 			}
 			int len = PROTO_HDR_LEN + GCM_IV_LEN + n + GCM_TAG_LEN;
 			c->tout+=len;
+			pr_debug("to tun encrypted ===========================, len: %d\n", len);
 			if (write_all(sendto, c->sofd, out, len, 0, (struct sockaddr *)&c->server, sizeof(c->server))) {
 				_log("error write");
 				break;
