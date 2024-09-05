@@ -336,18 +336,18 @@ out:
 	for (int i = 0; i < h->blen; ++i) \
 		for (n = h->tab[i], __next=NULL; n && ((__next = n->next) || 1); n=__next)
 
-#ifdef ENABLE_LOG
 static pthread_mutex_t log_lock;
 static FILE *logfile;
-#endif
 
 static inline void log_init() {
-#ifdef ENABLE_LOG
 	pthread_mutex_init(&log_lock, NULL);
+#ifdef ENABLE_LOG
 	logfile = fopen(LOG_FILE, "a+");
 	if (!logfile) {
 		err_exit("error opening log file: " LOG_FILE);
 	}
+#else
+	logfile = stdout;
 #endif
 }
 static inline void log_uninit() {
@@ -356,8 +356,8 @@ static inline void log_uninit() {
 #endif
 }
 
-#ifdef ENABLE_LOG
 static void log_rotate() {
+#ifdef ENABLE_LOG
 	struct stat st;
 	if (!stat(LOG_FILE, &st) && st.st_size > LOG_MAX_SIZE) {
 		fclose(logfile);
@@ -384,11 +384,10 @@ static void log_rotate() {
 		free(buf);
 		logfile = fopen(LOG_FILE, "a+");
 	}
-}
 #endif
+}
 
 static void _log(char *template, ...) {
-#ifdef ENABLE_LOG
 	pthread_mutex_lock(&log_lock);
 	log_rotate();
 	char buf[64];
@@ -401,7 +400,6 @@ static void _log(char *template, ...) {
 	fprintf(logfile, "\n");
 	fflush(logfile);
 	pthread_mutex_unlock(&log_lock);
-#endif
 }
 
 static int stop;
