@@ -165,6 +165,7 @@ typedef struct client {
 	uint32_t tun_ipv4;
 	unsigned char *key;
 	time_t heartbeat;
+	pthread_mutex_t lock; // protect the addr
 	struct sockaddr_in addr;
 } client;
 
@@ -798,6 +799,7 @@ ip_allocated:
 				c->clients[idx].key = key;
 				c->clients[idx].addr = *remote;
 				c->clients[idx].tun_ipv4 = *(uint32_t *)ip;
+				pthread_mutex_init(&c->clients[idx].lock, NULL);
 				//c->clients[idx].heartbeat = time(NULL);
 				htab_insert(c->conns, (void *)c->clients[idx].sessionid, &c->clients[idx]);
 				_log("client connected, id: %x, tip: %x, addr: %x, port: %x, session id: %x",
@@ -873,6 +875,9 @@ static void *from_tun(void *hc) {
 			}
 			pr_debug("recv: session: %x, client addr: %x, port: %x\n", sid, clt->addr.sin_addr.s_addr, clt->addr.sin_port);
 			key = clt->key;
+			pthread_mutex_lock(&clt->lock);
+			clt->addr = ra; // udpate with the latest address
+			pthread_mutex_unlock(&clt->lock);
 			n-=PROTO_HDR_LEN;
 			iv = buf + PROTO_HDR_LEN;
 			msg = buf + PROTO_HDR_LEN + GCM_IV_LEN;
@@ -937,7 +942,7 @@ static void *to_tun(void *hc) {
 		pr_debug("to tun===========================end\n");
 		
 		if (c->mode == SERVER) {
-			struct client *clt;
+			client *clt;
 			int host = ip_host(buf);
 			int i = h2idx(host);
 			if (i < 0 || i >= MAX_CONN || !c->clients[i].id) {
@@ -946,8 +951,11 @@ static void *to_tun(void *hc) {
 			}
 			clt = &c->clients[i];
 			unsigned char *key = clt->key;
-			struct sockaddr_in *to = &clt->addr;
-			if (enc_and_send(c, c->sofd, key, buf, n, (struct sockaddr *)to, sizeof(*to))) {
+			struct sockaddr_in to;
+			pthread_mutex_lock(&clt->lock);
+			to = clt->addr;
+			pthread_mutex_unlock(&clt->lock);
+			if (enc_and_send(c, c->sofd, key, buf, n, (struct sockaddr *)&to, sizeof(to))) {
 				break;
 			}
 		} else {
