@@ -1435,9 +1435,11 @@ int main(int argc, char **argv) {
 		context.tundev= dev ? dev : CDEV;
 		context.vs = server;
 		// connect
-		if (_connect(&context)) {
-			_log("unable to connect");
-			exit(1);
+		for (int i = 0; _connect(&context);) {
+			_log("connection failed, retrying %d...", i);
+			if (i++ == 1000) {
+				exit(EXIT_FAILURE);
+			}
 		}
 	}
 	setup_int();
