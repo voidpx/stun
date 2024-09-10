@@ -41,7 +41,9 @@
 #define GCM_IV_LEN 12
 #define GCM_TAG_LEN 16
 
-#define PACKET_MAX_LEN 1500
+#define PACKET_MAX_LEN_C 1500
+#define PACKET_MAX_LEN_S ((65535 & ~0x7) - 8 - 60) // max ipv4 len - udp header - max ipv4 header, round to 8 boundary
+
 
 #define MAX_CONN 10
 #define ID_LEN 4
@@ -210,6 +212,14 @@ typedef struct ctx {
 	unsigned char iv[GCM_IV_LEN];
 	char gw[16];
 	char mif[IFNAMSIZ + 1];
+	unsigned char *recv_buf;
+	unsigned char *send_buf;
+	unsigned char *enc_buf;
+	unsigned char *dec_buf;
+	int recv_buf_len;
+	int send_buf_len;
+	int enc_buf_len;
+	int dec_buf_len;
 } ctx;
 
 static int session_hash(void *key) {
@@ -500,7 +510,7 @@ static void enable_forwarding() {
 static void setup_dev(ctx *c) {
 	char *dev = c->tundev;
 	_CMD(exec_cmd("ip link set dev %s up", dev));
-	_CMD(exec_cmd("ip link set dev %s mtu %d", dev, c->mode == SERVER ? MTU : MTU - PROTO_HDR_LEN));
+	_CMD(exec_cmd("ip link set dev %s mtu %d", dev, c->mode == SERVER ? 9001 : MTU - PROTO_HDR_LEN));
 //	_CMD(exec_cmd("ip link set dev %s multicast off", dev));
 	if (c->mode == CLIENT) {
 		int host = ((char *)&c->tip)[3];
@@ -694,8 +704,8 @@ static void update_iv(ctx *c) {
 }
 
 static int enc_and_send(ctx *c,  int so, unsigned char *key, unsigned char *buf, int len, struct sockaddr *addr, socklen_t sl) {
-	assert(len <= PACKET_MAX_LEN - GCM_IV_LEN - GCM_TAG_LEN);
-	unsigned char out[PACKET_MAX_LEN];
+	assert(len <= c->enc_buf_len - GCM_IV_LEN - GCM_TAG_LEN);
+	unsigned char *out = c->enc_buf;
 	memcpy(out, c->iv, sizeof(c->iv));
 	if (enc(c, c->iv, key, buf, len, out + sizeof(c->iv)) < 0) {
 		_log("encryption error");
@@ -829,11 +839,12 @@ static void *from_tun(void *hc) {
 	ctx *c = (ctx *)hc;
 	int sfd = c->sofd;
 	int n;
-	unsigned char buf[PACKET_MAX_LEN];
-	unsigned char dbuf[PACKET_MAX_LEN];
+	unsigned char *buf = c->recv_buf;
+	int buf_len = c->recv_buf_len;
+	unsigned char *dbuf = c->dec_buf;
 	struct sockaddr_in ra = {0};
 	socklen_t ral = sizeof(ra);
-	while ((n = recvfrom(sfd, buf, sizeof(buf), 0, (struct sockaddr *)&ra, &ral)) >= 0) {
+	while ((n = recvfrom(sfd, buf, buf_len, 0, (struct sockaddr *)&ra, &ral)) >= 0) {
 		if (n == 0) {
 			continue;
 		}
@@ -930,13 +941,13 @@ static void *to_tun(void *hc) {
 	ctx *c = (ctx *)hc;
 	int fd = c->tunfd;
 	int n;
-	unsigned char buf[PACKET_MAX_LEN - sizeof(c->iv) - GCM_TAG_LEN + (c->mode == SERVER ? 0 : PROTO_HDR_LEN)];
-	while ((n = read(fd, buf, sizeof(buf))) > 0) {
+	unsigned char *buf = c->send_buf;
+	while ((n = read(fd, buf, c->send_buf_len)) > 0) {
 		if (!check_ip(buf)) {
 			pr_debug("multicast ignored\n");
 			continue;
 		}
-		
+//		_log("to_tun: buf_len: %d, read: %d", c->send_buf_len, n);
 		pr_debug("to tun===========================, len: %d\n", n);
 		pr_debug_iphdr(buf);
 		pr_debug("to tun===========================end\n");
@@ -959,7 +970,8 @@ static void *to_tun(void *hc) {
 				break;
 			}
 		} else {
-			unsigned char out[PACKET_MAX_LEN];
+			assert(n <= c->enc_buf_len - PROTO_HDR_LEN - GCM_IV_LEN - GCM_TAG_LEN);
+			unsigned char *out = c->enc_buf;
 			out[0] = PROTO_VERSION;
 			out[1] = PROTO_OP_FORWARD;
 			unsigned char *outb = out+2;
@@ -1192,6 +1204,16 @@ next:
 
 static void cleanup(ctx *c) {
 	_log("cleanup");
+	if (c->to_tun) {
+		pthread_cancel(c->to_tun);
+		pthread_cancel(c->from_tun);
+		pthread_join(c->to_tun, NULL);
+		pthread_join(c->from_tun, NULL);
+		c->to_tun = 0;
+		c->from_tun = 0;
+		close(c->tunfd);
+		close(c->sofd);
+	}
 	if (c->mode == SERVER) {
 		exec_cmd("ip6tables -t nat -D POSTROUTING -o %s -j MASQUERADE -s fc00::/120", c->mif);
 		exec_cmd("iptables -t nat -D POSTROUTING -o %s -j MASQUERADE -s 10.0.0.0/24", c->mif);
@@ -1208,18 +1230,7 @@ static void cleanup(ctx *c) {
 
 static void reconnect(ctx *c) {
 	_log("reconnecting");
-	if (c->to_tun) {
-		pthread_cancel(c->to_tun);
-		pthread_cancel(c->from_tun);
-		pthread_join(c->to_tun, NULL);
-		pthread_join(c->from_tun, NULL);
-		c->to_tun = 0;
-		c->from_tun = 0;
-		close(c->tunfd);
-		close(c->sofd);
-		cleanup(c);
-
-	}
+	cleanup(c);
 	// retrieve the default gw again
 	if (!get_def(c)) {
 		_connect(c);
@@ -1314,8 +1325,6 @@ out:
 	if (c->mode == CLIENT && !c->down) {
 		client_quit(c);
 	}
-	close(c->sofd);
-	close(c->tunfd);
 }
 
 static void init_crypto(char *keyfile, ctx *c) {
@@ -1353,6 +1362,44 @@ static inline void start_server(ctx *c) {
 	c->sofd = bind_newsk(c->port, INADDR_ANY);
 	setup_tun(c);
 	start_forwarding(c);
+}
+
+static void init_buffer(ctx *c) {
+	int recv_buf_len;
+	int send_buf_len;
+	int enc_buf_len;
+	if (c->mode == SERVER) {
+		recv_buf_len = PACKET_MAX_LEN_C;
+		send_buf_len = PACKET_MAX_LEN_S - GCM_IV_LEN - GCM_TAG_LEN;
+		enc_buf_len = PACKET_MAX_LEN_S;
+	} else {
+		recv_buf_len = PACKET_MAX_LEN_S;
+		send_buf_len = PACKET_MAX_LEN_C - GCM_IV_LEN - GCM_TAG_LEN - PROTO_HDR_LEN;
+		enc_buf_len = PACKET_MAX_LEN_C;
+	}
+	c->recv_buf_len = c->dec_buf_len = recv_buf_len;
+	c->recv_buf = malloc(c->recv_buf_len);
+	c->dec_buf = malloc(c->dec_buf_len);
+
+	c->send_buf_len = send_buf_len;
+	c->send_buf = malloc(c->send_buf_len);
+
+	c->enc_buf_len = enc_buf_len;
+	c->enc_buf = malloc(c->enc_buf_len);
+	if (!c->recv_buf || !c->send_buf || !c->enc_buf || !c->dec_buf) {
+		err_exit("error init_buffer");
+	}
+	_log("recv_buf_len: %d", c->recv_buf_len);
+	_log("dec_buf_len: %d", c->dec_buf_len);
+	_log("send_buf_len: %d", c->send_buf_len);
+	_log("enc_buf_len: %d", c->enc_buf_len);
+}
+
+static void uninit_buffer(ctx *c) {
+	free(c->recv_buf);
+	free(c->dec_buf);
+	free(c->send_buf);
+	free(c->enc_buf);
 }
 
 int main(int argc, char **argv) {
@@ -1413,6 +1460,8 @@ int main(int argc, char **argv) {
 	context.port = port;
 	init_crypto(kf, &context);
 
+	init_buffer(&context);
+
 	if (get_def(&context)) {
 		err_exit("error retrieving default gateway");
 	}
@@ -1436,8 +1485,11 @@ int main(int argc, char **argv) {
 		context.vs = server;
 		// connect
 		for (int i = 0; _connect(&context);) {
-			_log("connection failed, retrying %d...", i);
-			if (i++ == 1000) {
+#define RETRY_TO 5
+			_log("connection failed, retry after %d seconds", RETRY_TO);
+			sleep(RETRY_TO);
+			_log("retrying... %d", i);
+			if (i++ == 17280) {
 				exit(EXIT_FAILURE);
 			}
 		}
@@ -1446,6 +1498,7 @@ int main(int argc, char **argv) {
 
 	wait_for_stop(&context, sport);
 
+	uninit_buffer(&context);
 	uninit_crypto(&context);
 	cleanup(&context);
 	log_uninit();
