@@ -42,7 +42,7 @@
 #define GCM_TAG_LEN 16
 
 #define PACKET_MAX_LEN_C 1500
-#define PACKET_MAX_LEN_S ((65535 & ~0x7) - 8 - 60) // max ipv4 len - udp header - max ipv4 header, round to 8 boundary
+#define PACKET_MAX_LEN_S ((65535 - 8 - 60) & ~0x7) // max ipv4 len - udp header - max ipv4 header
 
 
 #define MAX_CONN 10
