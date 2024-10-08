@@ -2,6 +2,12 @@
 
 this is a simple and fast tunnel using pre-shared keys for encryption. it tunnels both ipv4 and ipv6 packets into a ipv4 tunnel. this program uses the `ip` and `iptables` & `ip6tables` commands to manipulate ip addresses, routes and ip tables, so it requires the user to have corresponding capabilities, or simply run as root. this program uses the `crypto` lib for encryption.
 
+### build
+
+```bash
+$ make all
+```
+
 ### usage
 
 start the server on a machine which could forward packets:

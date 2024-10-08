@@ -414,6 +414,7 @@ static void _log(char *template, ...) {
 }
 
 static int stop;
+static int off;
 
 #define _C_1(cond)\
 	do {if (cond) return -1;} while (0)
@@ -1093,7 +1094,7 @@ err:
 	"A simple tunnel using pre-shared key for encryption\n\n"\
 	"usage:\n"\
 	"\t-s <vpn server> required for client mode\n"\
-	"\t-p <port> optionl, the port to listen on in server mode, otherwise the server port to connect to, defualt is 8888\n"\
+	"\t-p <port> optionl, the port to listen on in server mode, otherwise the server port to connect to, defualt is %d\n"\
 	"\t-i <interface> optional, the internet facing network interface\n"\
 	"\t-k <key file> optional, the key file to use, see the -g option below, default is 'tun.key' in cwd\n"\
 	"\t-g generate a key and ouput to stdout\n"\
@@ -1289,7 +1290,7 @@ static void wait_for_stop(ctx *c, int port) {
 		if (stop) {
 			break;
 		}
-		if (c->mode == CLIENT && c->down) {
+		if (!off && c->mode == CLIENT && c->down) {
 			time_t now = time(NULL);
 			if (now - lastreconn > 5) {
 				_log("connection was down, last reconnect: %ld, now: %ld, reconnect", lastreconn, now);
@@ -1311,6 +1312,22 @@ static void wait_for_stop(ctx *c, int port) {
 			if (n >= 4 && !strncmp(buf, "stop", 4)) {
 				_log("stop received");
 				goto out;
+			} else if (c->mode == CLIENT && n >= 3 && !strncmp(buf, "off", 3)) {
+				_log("off received");
+				if (!off) {
+					off = 1;
+					cleanup(c);
+				} else {
+					_log("already off");
+				}
+			} else if (c->mode == CLIENT && n >= 2 && !strncmp(buf, "on", 2)) {
+				_log("on received");
+				if (off) {
+					reconnect(c);
+					off = 0;
+				} else {
+					_log("already on");
+				}
 			} else if (c->mode == SERVER && n>=4 && !strncmp(buf, "list", 4)) {
 				dump_conns(c, so, (struct sockaddr *)&ra, ral);
 			} else if (!strncmp(buf, "stat", 4)) {
@@ -1427,7 +1444,7 @@ int main(int argc, char **argv) {
 			mif = argv[i+1];
 			i+=1;
 		} else if (!strcmp(argv[i], "-h")) {
-			printf("%s", USAGE);
+			printf(USAGE, PORT);
 			exit(0);
 		} else if (!strcmp(argv[i], "-k") && i+1 < argc) {
 			kf = argv[i+1];
