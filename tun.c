@@ -1419,6 +1419,22 @@ static void uninit_buffer(ctx *c) {
 	free(c->enc_buf);
 }
 
+static void daemonize() {
+	pid_t pid = fork();
+	if (pid < 0) {
+		exit(EXIT_FAILURE);
+	} else if (pid > 0) {
+		exit(0);
+	}
+	setsid();
+	pid = fork();
+	if (pid < 0) {
+		exit(EXIT_FAILURE);
+	} else if (pid > 0) {
+		exit(0);
+	}
+}
+
 int main(int argc, char **argv) {
 	enum Mode m = SERVER;
 	int port = PORT;
@@ -1428,6 +1444,7 @@ int main(int argc, char **argv) {
 	char *gw = NULL;
 	char *dev = NULL;
 	int sport = 0;
+	int daemon = 0;
 	// poor man's arg parse
 	for (int i = 1; i < argc; i++) {
 		if (!strcmp(argv[i], "-s") && i+1 < argc) {
@@ -1458,8 +1475,12 @@ int main(int argc, char **argv) {
 		} else if (!strcmp(argv[i], "-d") && i+1 < argc) {
 			dev = argv[i+1];
 			i+=1;
+		} else if (!strcmp(argv[i], "-D")) {
+			daemon = 1;
 		}
 	}
+
+	if (daemon) daemonize();
 
 	debug_init();
 	log_init();
@@ -1467,7 +1488,6 @@ int main(int argc, char **argv) {
 	if (!sport) {
 		sport = port + 1;
 	}
-
 	if (!kf) {
 		kf = "tun.key";
 	}
