@@ -1021,12 +1021,12 @@ static int _connect(ctx *c) {
 	addr.sin_port = htons(c->port);
 	c->server = addr;
 
+	int epollfd = create_epollfd();
 	if (connect(so, (struct sockaddr *)&addr, sizeof(addr))) {
 		goto err;
 	}
 	c->sofd = so;
 	set_nonblock(so);
-	int epollfd = create_epollfd();
 	epoll_add(epollfd, so);
 
 	unsigned char *id = c->id;
@@ -1087,6 +1087,8 @@ gotresp:
 	start_forwarding(c);
 	return 0;
 err:
+	close(so);
+	close(epollfd);
 	return -1;
 }
 
