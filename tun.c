@@ -845,9 +845,13 @@ static void *from_tun(void *hc) {
 	unsigned char *dbuf = c->dec_buf;
 	struct sockaddr_in ra = {0};
 	socklen_t ral = sizeof(ra);
-	while ((n = recvfrom(sfd, buf, buf_len, 0, (struct sockaddr *)&ra, &ral)) >= 0) {
-		if (n == 0) {
+	while (1) {
+		n = recvfrom(sfd, buf, buf_len, 0, (struct sockaddr *)&ra, &ral);
+		if (n == 0 || (n == -1 && errno == EMSGSIZE)) { // ignore message too long error
 			continue;
+		}
+		if (n < 0) { // other errors, down
+			break;
 		}
 		c->tin+=n;
 		int min_len = c->mode == SERVER ? sizeof(c->iv) + GCM_TAG_LEN + PROTO_HDR_LEN : sizeof(c->iv) + GCM_TAG_LEN;
@@ -921,6 +925,7 @@ static void *from_tun(void *hc) {
 		}
 	}
 	c->down = 1;
+	perror("from_tun: DOWN");
 	return NULL;
 }
 
@@ -968,6 +973,7 @@ static void *to_tun(void *hc) {
 			to = clt->addr;
 			pthread_mutex_unlock(&clt->lock);
 			if (enc_and_send(c, c->sofd, key, buf, n, (struct sockaddr *)&to, sizeof(to))) {
+				_log("error enc_and_send");
 				break;
 			}
 		} else {
@@ -996,6 +1002,7 @@ static void *to_tun(void *hc) {
 		}
 	}
 	c->down = 1;
+	perror("to_tun: DOWN");
 	return NULL;
 }
 
