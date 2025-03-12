@@ -61,8 +61,6 @@ typedef struct ipv6hdr ipv6hdr;
 
 #define TUN_PKT_OFFSET 4
 
-#endif
-
 typedef unsigned char __u8;
 typedef unsigned short __be16;
 typedef unsigned short __sum16;
@@ -94,6 +92,8 @@ typedef struct ipv6hdr {
 } ipv6hdr;
 #undef IN6_IS_ADDR_MULTICAST
 #define IN6_IS_ADDR_MULTICAST(a) ((*a)[0] == (unsigned char)0xff)
+#endif
+
 
 #define SDEV "stun"
 #define CDEV "ctun"
@@ -751,7 +751,7 @@ static int get_def(ctx *c) {
     char *p = strtok(line, " \t");
     char *n = strtok(NULL, " \t");
     if (p && n && !strcmp(n, "00000000")) {
-      strncpy(c->mif, p, sizeof(c->mif));
+      strncpy(c->mif, p, sizeof(c->mif) - 1);
       p = strtok(NULL, " \t");
       if (p) {
         unsigned int gw;
@@ -1689,7 +1689,7 @@ out:
 
 static void getrandombytes(unsigned char *buf, size_t len) {
 #if defined(__linux__)
-  if (getrandom(buf, len, 0) != sizeof(len)) {
+  if (getrandom(buf, len, 0) != len) {
     err_exit("error getrandom");
   }
 #elif defined(__MACH__)
@@ -1859,7 +1859,7 @@ int main(int argc, char **argv) {
   }
 
   if (mif) {
-    strncpy(context.mif, mif, sizeof(context.mif));
+    strncpy(context.mif, mif, sizeof(context.mif) - 1);
   }
   if (m == SERVER) {
     context.tundev = dev ? dev : SDEV;
