@@ -704,7 +704,7 @@ static int get_def_gw(int af, char *gw, size_t gwlen, char *dev,
     }
   } else {
     pr_debug("default gateway: unable to retrieve device name for %s\n",
-            af == AF_INET ? "v4" : "v6");
+             af == AF_INET ? "v4" : "v6");
     goto err_free_out;
   }
   err = 0;
@@ -1593,7 +1593,8 @@ static void client_quit(ctx *c) {
 
 #ifdef __MACH__
 static void client_remove_in6_gw(ctx *c) {
-  if (c->mode != CLIENT) return;
+  if (c->mode != CLIENT)
+    return;
   FILE *fp;
   char buf[128] = {0};
   fp =
@@ -1661,11 +1662,13 @@ static void wait_for_stop(ctx *c, int port) {
       }
     }
 #ifdef __MACH__
-    client_watch_def_gw(c);
-    // dirty hack: on macOS, ipv6 default gateway is always automatically
-    // added, which causes the VPN to not work for some sites that use ipv6,
-    // here just watch and remove it if present
-    client_remove_in6_gw(c);
+    if (!off) {
+      client_watch_def_gw(c);
+      // dirty hack: on macOS, ipv6 default gateway is always automatically
+      // added, which causes the VPN to not work for some sites that use ipv6,
+      // here just watch and remove it if present
+      client_remove_in6_gw(c);
+    }
 #endif
     if (nfds == 0) {
       continue;
