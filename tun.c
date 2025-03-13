@@ -1839,7 +1839,7 @@ int main(int argc, char **argv) {
   int sport = 0;
   int daemon = 0;
   char opt;
-  while ((opt = getopt(argc, argv, "hgDs:p:P:i:k:n:d:")) != -1) {
+  while ((opt = getopt(argc, argv, "hgDs:p:P:i:k:n:d:")) != (char)-1) {
     switch (opt) {
     case 's':
       m = CLIENT;
