@@ -94,7 +94,6 @@ typedef struct ipv6hdr {
 #define IN6_IS_ADDR_MULTICAST(a) ((*a)[0] == (unsigned char)0xff)
 #endif
 
-
 #define SDEV "stun"
 #define CDEV "ctun"
 
@@ -123,6 +122,7 @@ typedef struct ipv6hdr {
 
 #define MTU                                                                    \
   (1500 - 20 - GCM_TAG_LEN - GCM_IV_LEN - 8) // max without fragmentation
+#define SERVER_MTU 9001
 
 #define LOG_FILE "/var/log/tun.log"
 
@@ -280,9 +280,6 @@ typedef struct ctx {
   int down;
   unsigned char iv[GCM_IV_LEN];
   char gw[16];
-#ifdef __MACH__
-  char gw6[80];
-#endif
   char mif[IFNAMSIZ];
   unsigned char *recv_buf;
   unsigned char *send_buf;
@@ -580,17 +577,15 @@ static void setup_routes(ctx *c, int reconfig) {
     exec_cmd("ip -6 route add ::/0 dev %s metric 10", dev);
 #elif defined(__MACH__)
     exec_cmd("route delete default");
-    int err = exec_cmd("route add default 10.0.0.%d -ifp %s", ip[3], dev);
+    int err = exec_cmd("route -n add default 10.0.0.%d -ifp %s", ip[3], dev);
     if (!reconfig) {
       _CMD(err);
     }
-    exec_cmd("route add %s %s -ifp %s", c->vs, c->gw, c->mif);
+    exec_cmd("route -n add %s %s -ifp %s", c->vs, c->gw, c->mif);
     // v6
-   // if (c->gw6[0] != 0) {
-   //   exec_cmd("route delete -inet6 default");
-   // }
-    exec_cmd("route add -inet6 default fc00::%d -ifp %s", ip[3],
-             dev);
+    exec_cmd("route -n delete -inet6 fe80::1:%d%%%s", ip[3], dev);
+    exec_cmd("route -n add -inet6 default fe80::1:%d%%%s -ifscope %s", ip[3],
+             dev, dev);
 #endif
   }
 }
@@ -608,7 +603,6 @@ static void enable_forwarding() {
   close(fd);
 }
 
-#define SERVER_MTU 9001
 static void setup_dev(ctx *c) {
   char *dev = c->tundev;
   //	_CMD(exec_cmd("ip link set dev %s multicast off", dev));
@@ -618,12 +612,12 @@ static void setup_dev(ctx *c) {
     _CMD(exec_cmd(
         "ifconfig %s 10.0.0.%d 10.0.0.1 netmask 255.255.255.0 mtu %d up", dev,
         host, MTU - PROTO_HDR_LEN));
-    _CMD(exec_cmd("ifconfig %s inet6 fc00::%d/120 add", dev, host));
+    _CMD(exec_cmd("ifconfig %s inet6 fe80::1:%d/120 add", dev, host));
 #elif defined(__linux__)
     _CMD(exec_cmd("ip link set dev %s mtu %d up", dev, MTU - PROTO_HDR_LEN));
     _CMD(exec_cmd("ip address add 10.0.0.%d/24 dev %s", host, dev));
     // v6
-    _CMD(exec_cmd("ip -6 addr add fc00::%d/120 dev %s", host, dev));
+    _CMD(exec_cmd("ip -6 addr add fe80::1:%d/120 dev %s", host, dev));
 #endif
   } else {
     enable_forwarding();
@@ -633,9 +627,9 @@ static void setup_dev(ctx *c) {
         "iptables -t nat -A POSTROUTING -o %s -j MASQUERADE -s 10.0.0.0/24",
         c->mif));
     // v6
-    _CMD(exec_cmd("ip -6 addr add fc00::1/120 dev %s", dev));
+    _CMD(exec_cmd("ip -6 addr add fe80::1:1/120 dev %s", dev));
     _CMD(exec_cmd(
-        "ip6tables -t nat -A POSTROUTING -o %s -j MASQUERADE -s fc00::/120",
+        "ip6tables -t nat -A POSTROUTING -o %s -j MASQUERADE -s fe80::1:0/120",
         c->mif));
   }
   setup_routes(c, 0);
@@ -654,23 +648,24 @@ static int bind_newsk(int port, in_addr_t a) {
   return so;
 }
 #ifdef __MACH__
-static int get_def_gw(ctx *c, int af) {
+static int get_def_gw(int af, char *gw, size_t gwlen, char *dev,
+                      size_t devlen) {
   int mib[6] = {CTL_NET, PF_ROUTE, 0, af, NET_RT_DUMP, 0};
   size_t len;
   int err = 0;
   if (sysctl(mib, 6, NULL, &len, NULL, 0) < 0) {
-    perror("sysctl: get route table size");
+    _log("sysctl: get route table size");
     goto err_out_nofree;
   }
 
   char *buf = malloc(len);
   if (!buf) {
-    perror("malloc");
+    _log("malloc");
     goto err_out_nofree;
   }
 
   if (sysctl(mib, 6, buf, &len, NULL, 0) < 0) {
-    perror("sysctl: get route table data");
+    _log("sysctl: get route table data");
     goto err_free_out;
   }
 
@@ -686,20 +681,8 @@ static int get_def_gw(ctx *c, int af) {
         struct sockaddr_in *sin =
             (struct sockaddr_in *)((struct sockaddr_in *)(rtm + 1) + 1);
         if (sin->sin_family == AF_INET && sin->sin_addr.s_addr != 0) {
-          if (!inet_ntop(AF_INET, &sin->sin_addr, c->gw, sizeof(c->gw))) {
-            perror("error retrieving INET gateway");
-            goto err_free_out;
-          }
-          ifindex = rtm->rtm_index;
-          break;
-        }
-      } else { // ipv6
-        struct sockaddr_in6 *sin =
-            (struct sockaddr_in6 *)((struct sockaddr_in6 *)(rtm + 1) + 1);
-        if (sin->sin6_family == AF_INET6 &&
-            !IN6_IS_ADDR_UNSPECIFIED(&sin->sin6_addr)) {
-          if (!inet_ntop(AF_INET6, &sin->sin6_addr, c->gw6, sizeof(c->gw6))) {
-            perror("error retrieving INET6 gateway");
+          if (!inet_ntop(AF_INET, &sin->sin_addr, gw, gwlen)) {
+            _log("error retrieving INET gateway");
             goto err_free_out;
           }
           ifindex = rtm->rtm_index;
@@ -710,17 +693,18 @@ static int get_def_gw(ctx *c, int af) {
   }
 
   if (ifindex > 0) {
-    if (af == AF_INET) {
+    if (af == AF_INET && dev) {
       char ifname[IFNAMSIZ];
       if (if_indextoname(ifindex, ifname)) {
-        strncpy(c->mif, ifname, sizeof(ifname));
+        strncpy(dev, ifname, devlen);
       } else {
-        perror("if_indextoname failed");
+        _log("if_indextoname failed");
         goto err_free_out;
       }
     }
   } else {
-    fprintf(stderr, "default gateway: unable to retrieve device name for %s\n", af == AF_INET ? "v4" : "v6");
+    pr_debug("default gateway: unable to retrieve device name for %s\n",
+            af == AF_INET ? "v4" : "v6");
     goto err_free_out;
   }
   err = 0;
@@ -766,12 +750,8 @@ static int get_def(ctx *c) {
   fclose(fp);
 
 #elif defined(__MACH__)
-  if (get_def_gw(c, AF_INET) == -1) {
+  if (get_def_gw(AF_INET, c->gw, sizeof(c->gw), c->mif, sizeof(c->mif)) == -1) {
     return -1;
-  }
-  c->gw6[0] = 0;
-  if (get_def_gw(c, AF_INET6) == -1) {
-    _log("inet6 gateway not found");
   }
 #endif
   return 0;
@@ -1534,30 +1514,24 @@ static void cleanup(ctx *c) {
   }
   if (c->mode == SERVER) {
     exec_cmd(
-        "ip6tables -t nat -D POSTROUTING -o %s -j MASQUERADE -s fc00::/120",
+        "ip6tables -t nat -D POSTROUTING -o %s -j MASQUERADE -s fe80::1:0/120",
         c->mif);
     exec_cmd(
         "iptables -t nat -D POSTROUTING -o %s -j MASQUERADE -s 10.0.0.0/24",
         c->mif);
     exec_cmd("ip route delete 10.0.0.0/24 dev %s", c->tundev);
-    exec_cmd("ip -6 route delete fc00::/120 dev %s", c->tundev);
+    exec_cmd("ip -6 route delete fe80::1:0/120 dev %s", c->tundev);
     htab_free(c->conns);
   } else {
-#if defined(__linux__)
     char *ip = (char *)&c->tip;
+#if defined(__linux__)
     exec_cmd("ip route delete %s via %s dev %s", c->vs, c->gw, c->mif);
     exec_cmd("ip route delete default via 10.0.0.%d metric 10", ip[3]);
     exec_cmd("ip -6 route delete ::/0 dev %s metric 10", c->tundev);
 #elif defined(__MACH__)
-    exec_cmd("route delete %s %s -ifp %s", c->vs, c->gw, c->mif);
-    exec_cmd("route delete default");
-    exec_cmd("route add default %s -ifp %s", c->gw, c->mif);
-    char *ip = (char *)&c->tip;
-    exec_cmd("route delete -inet6 default fc00::%d -ifp %s", ip[3], c->tundev);
-    //if (c->gw6[0] != 0) {
-      //exec_cmd("route add -inet6 default %s -ifp %s -ifscope %s", c->gw6, c->mif,
-      //       c->mif);
-    //}
+    exec_cmd("route -n delete %s %s -ifp %s", c->vs, c->gw, c->mif);
+    exec_cmd("route -n delete default 10.0.0.%d -ifp %s", ip[3], c->tundev);
+    exec_cmd("route -n add default %s -ifp %s", c->gw, c->mif);
 #endif
   }
 }
@@ -1617,6 +1591,54 @@ static void client_quit(ctx *c) {
   }
 }
 
+#ifdef __MACH__
+static void client_remove_in6_gw(ctx *c) {
+  if (c->mode != CLIENT) return;
+  FILE *fp;
+  char buf[128] = {0};
+  fp =
+      popen("netstat -nr | grep -o 'default.*%en0' | sed 's/default *//'", "r");
+  if (fp == NULL) {
+    pr_debug("failed to run netstat\n");
+    return;
+  }
+
+  while (fgets(buf, sizeof(buf), fp) != NULL) {
+    pr_debug("%s\n", buf);
+    break;
+  }
+  pclose(fp);
+  int len = strlen(buf);
+  if (len > 0 && buf[len - 1] == '\a') {
+    buf[len - 1] = '\0';
+  }
+  if (buf[0]) {
+    exec_cmd("route -n delete -inet6 default %s", buf);
+  }
+}
+
+/*
+ * network up -> down -> up, e.g. wifi on -> off -> on, on macOS, seems it
+ * couldn't detect that and just hangs, workaround it by setting
+ */
+static void client_watch_def_gw(ctx *c) {
+  if (c->mode != CLIENT) {
+    return;
+  }
+  char gw[16];
+  char buf[16];
+  if (get_def_gw(AF_INET, gw, sizeof(gw), NULL, 0) == -1) {
+    c->down = 1;
+  } else {
+    int host = ((char *)&c->tip)[3];
+    snprintf(buf, sizeof(buf), "10.0.0.%d", host);
+    if (strncmp(buf, gw, strlen(buf))) {
+      c->down = 1;
+    }
+  }
+}
+#endif
+
 static void wait_for_stop(ctx *c, int port) {
   int so = bind_newsk(port, htonl(INADDR_LOOPBACK));
   set_nonblock(so);
@@ -1637,9 +1659,14 @@ static void wait_for_stop(ctx *c, int port) {
         // reconnect fail
         lastreconn = time(NULL);
       }
-    } /* else {
-             cleanup_dead_conns(c);
-     }*/
+    }
+#ifdef __MACH__
+    client_watch_def_gw(c);
+    // dirty hack: on macOS, ipv6 default gateway is always automatically
+    // added, which causes the VPN to not work for some sites that use ipv6,
+    // here just watch and remove it if present
+    client_remove_in6_gw(c);
+#endif
     if (nfds == 0) {
       continue;
     }
@@ -1789,6 +1816,15 @@ static void daemonize() {
   }
 }
 
+static int parse_port(const char *str) {
+  errno = 0;
+  long p = strtol(str, NULL, 0);
+  if (errno) {
+    err_exit("invalid port");
+  }
+  return (int)p;
+}
+
 int main(int argc, char **argv) {
   enum Mode m = SERVER;
   int port = PORT;
@@ -1799,38 +1835,45 @@ int main(int argc, char **argv) {
   char *dev = NULL;
   int sport = 0;
   int daemon = 0;
-  // poor man's arg parse
-  for (int i = 1; i < argc; i++) {
-    if (!strcmp(argv[i], "-s") && i + 1 < argc) {
+  char opt;
+  while ((opt = getopt(argc, argv, "hgDs:p:P:i:k:n:d:")) != -1) {
+    switch (opt) {
+    case 's':
       m = CLIENT;
-      server = argv[i + 1];
-      i += 1;
-    } else if (!strcmp(argv[i], "-p") && i + 1 < argc) {
-      port = atoi(argv[i + 1]);
-      i += 1;
-    } else if (!strcmp(argv[i], "-P") && i + 1 < argc) {
-      sport = atoi(argv[i + 1]);
-      i += 1;
-    } else if (!strcmp(argv[i], "-i") && i + 1 < argc) {
-      mif = argv[i + 1];
-      i += 1;
-    } else if (!strcmp(argv[i], "-h")) {
+      server = optarg;
+      break;
+    case 'p':
+      port = parse_port(optarg);
+      break;
+    case 'P':
+      sport = parse_port(optarg);
+      break;
+    case 'i':
+      mif = optarg;
+      break;
+    case 'k':
+      kf = optarg;
+      break;
+    case 'n':
+      gw = optarg;
+      break;
+    case 'd':
+      dev = optarg;
+      break;
+    case 'h':
       printf(USAGE, PORT);
       exit(0);
-    } else if (!strcmp(argv[i], "-k") && i + 1 < argc) {
-      kf = argv[i + 1];
-      i += 1;
-    } else if (!strcmp(argv[i], "-g")) {
+    case 'g':
       genkey();
       exit(0);
-    } else if (!strcmp(argv[i], "-n") && i + 1 < argc) {
-      gw = argv[i + 1];
-      i += 1;
-    } else if (!strcmp(argv[i], "-d") && i + 1 < argc) {
-      dev = argv[i + 1];
-      i += 1;
-    } else if (!strcmp(argv[i], "-D")) {
+    case 'D':
       daemon = 1;
+      break;
+    case '?':
+#ifdef __linux__
+      fprintf(stderr, "option %c requires an argument\n", optopt);
+#endif
+      exit(EXIT_FAILURE);
     }
   }
 
