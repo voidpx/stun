@@ -1500,6 +1500,62 @@ static void readkeys(char *keyfile, ctx *c) {
   fclose(fp);
 }
 
+#ifdef __MACH__
+static void client_remove_in6_gw(ctx *c) {
+  if (c->mode != CLIENT)
+    return;
+  FILE *fp;
+  char buf[128] = {0};
+  fp =
+      popen("netstat -nr | grep -o 'default.*%en0' | sed 's/default *//'", "r");
+  if (fp == NULL) {
+    pr_debug("failed to run netstat\n");
+    return;
+  }
+
+  while (fgets(buf, sizeof(buf), fp) != NULL) {
+    pr_debug("%s\n", buf);
+    break;
+  }
+  pclose(fp);
+  int len = strlen(buf);
+  if (len > 0 && buf[len - 1] == '\a') {
+    buf[len - 1] = '\0';
+  }
+  if (buf[0]) {
+    exec_cmd("route -n delete -inet6 default %s", buf);
+  }
+}
+
+static int client_is_vps_gw(ctx *c) {
+  if (c->mode != CLIENT) {
+    return 0;
+  }
+  char gw[16];
+  char buf[16];
+  if (get_def_gw(AF_INET, gw, sizeof(gw), NULL, 0) == -1) {
+    return 0;
+  } else {
+    int host = ((char *)&c->tip)[3];
+    snprintf(buf, sizeof(buf), "10.0.0.%d", host);
+    if (strncmp(buf, gw, strlen(buf))) {
+      return 0;
+    }
+  }
+  return 1;
+}
+
+/*
+ * network up -> down -> up, e.g. wifi on -> off -> on, on macOS, seems it
+ * couldn't detect that and just hangs, workaround it by setting
+ */
+static void client_watch_def_gw(ctx *c) {
+  if (!client_is_vps_gw(c)) {
+    c->down = 1;
+  }
+}
+#endif
+
 static void cleanup(ctx *c) {
   _log("cleanup");
   if (c->to_tun) {
@@ -1530,7 +1586,9 @@ static void cleanup(ctx *c) {
     exec_cmd("ip -6 route delete ::/0 dev %s metric 10", c->tundev);
 #elif defined(__MACH__)
     exec_cmd("route -n delete %s %s -ifp %s", c->vs, c->gw, c->mif);
-    exec_cmd("route -n delete default 10.0.0.%d -ifp %s", ip[3], c->tundev);
+    if (client_is_vps_gw(c)) {
+      exec_cmd("route -n delete default 10.0.0.%d -ifp %s", ip[3], c->tundev);
+    }
     exec_cmd("route -n add default %s -ifp %s", c->gw, c->mif);
 #endif
   }
@@ -1591,54 +1649,6 @@ static void client_quit(ctx *c) {
   }
 }
 
-#ifdef __MACH__
-static void client_remove_in6_gw(ctx *c) {
-  if (c->mode != CLIENT)
-    return;
-  FILE *fp;
-  char buf[128] = {0};
-  fp =
-      popen("netstat -nr | grep -o 'default.*%en0' | sed 's/default *//'", "r");
-  if (fp == NULL) {
-    pr_debug("failed to run netstat\n");
-    return;
-  }
-
-  while (fgets(buf, sizeof(buf), fp) != NULL) {
-    pr_debug("%s\n", buf);
-    break;
-  }
-  pclose(fp);
-  int len = strlen(buf);
-  if (len > 0 && buf[len - 1] == '\a') {
-    buf[len - 1] = '\0';
-  }
-  if (buf[0]) {
-    exec_cmd("route -n delete -inet6 default %s", buf);
-  }
-}
-
-/*
- * network up -> down -> up, e.g. wifi on -> off -> on, on macOS, seems it
- * couldn't detect that and just hangs, workaround it by setting
- */
-static void client_watch_def_gw(ctx *c) {
-  if (c->mode != CLIENT) {
-    return;
-  }
-  char gw[16];
-  char buf[16];
-  if (get_def_gw(AF_INET, gw, sizeof(gw), NULL, 0) == -1) {
-    c->down = 1;
-  } else {
-    int host = ((char *)&c->tip)[3];
-    snprintf(buf, sizeof(buf), "10.0.0.%d", host);
-    if (strncmp(buf, gw, strlen(buf))) {
-      c->down = 1;
-    }
-  }
-}
-#endif
 
 static void wait_for_stop(ctx *c, int port) {
   int so = bind_newsk(port, htonl(INADDR_LOOPBACK));
@@ -1657,7 +1667,6 @@ static void wait_for_stop(ctx *c, int port) {
         _log("connection was down, last reconnect: %ld, now: %ld, reconnect",
              lastreconn, now);
         reconnect(c);
-        // reconnect fail
         lastreconn = time(NULL);
       }
     }

@@ -3,8 +3,8 @@ CFLAGS = -Wall -Wno-int-to-pointer-cast -Wno-pointer-to-int-cast
 LDFLAGS = -lcrypto 
 OS := $(shell uname -s)
 ifeq ($(OS),Darwin)
-  CFLAGS += -I/opt/homebrew/opt/openssl@3.4/include
-  LDFLAGS += -L/opt/homebrew/opt/openssl@3.4/lib -framework Security
+  CFLAGS += -I/opt/homebrew/opt/openssl/include
+  LDFLAGS += -L/opt/homebrew/opt/openssl/lib -framework Security
 else ifeq ($(OS),Linux)
 else
   $(error, unsupported OS: $(OS))
