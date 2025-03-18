@@ -1547,7 +1547,7 @@ static int client_is_vps_gw(ctx *c) {
 
 /*
  * network up -> down -> up, e.g. wifi on -> off -> on, on macOS, seems it
- * couldn't detect that and just hangs, workaround it by setting
+ * couldn't detect that and just hangs, workaround it
  */
 static void client_watch_def_gw(ctx *c) {
   if (!client_is_vps_gw(c)) {
@@ -1649,6 +1649,43 @@ static void client_quit(ctx *c) {
   }
 }
 
+static int is_network_up(ctx *c) {
+#if defined(__linux__)
+  char buf[128];
+  snprintf(buf, sizeof(buf), "/sys/class/net/%s/operstate", c->mif);
+  FILE *fp = fopen(buf, "r");
+  int up = 0;
+  if (!fp) {
+    _log("error opening %s", buf);
+    goto out;
+  }
+  char line[8];
+  if (fgets(line, sizeof(line), fp) && !strncmp("up", line, 2)) {
+    up = 1;
+    goto out;
+  }
+out:
+  fclose(fp);
+  return up;
+#elif defined(__MACH__)
+  // TODO: check network on macos
+  return 1;
+#endif
+}
+
+static int client_should_reconnect(ctx *c) {
+  if (!c->down) {
+    if (!is_network_up(c)) {
+      c->down = 1;
+    }
+    return 0;
+  } else {
+    if (!is_network_up(c)) {
+      return 0;
+    }
+    return 1;
+  }
+}
 
 static void wait_for_stop(ctx *c, int port) {
   int so = bind_newsk(port, htonl(INADDR_LOOPBACK));
@@ -1661,7 +1698,7 @@ static void wait_for_stop(ctx *c, int port) {
     if (stop) {
       break;
     }
-    if (!off && c->mode == CLIENT && c->down) {
+    if (!off && client_should_reconnect(c)) {
       time_t now = time(NULL);
       if (now - lastreconn > 5) {
         _log("connection was down, last reconnect: %ld, now: %ld, reconnect",
@@ -1670,15 +1707,15 @@ static void wait_for_stop(ctx *c, int port) {
         lastreconn = time(NULL);
       }
     }
-#ifdef __MACH__
     if (!off) {
+#ifdef __MACH__
       client_watch_def_gw(c);
       // dirty hack: on macOS, ipv6 default gateway is always automatically
       // added, which causes the VPN to not work for some sites that use ipv6,
       // here just watch and remove it if present
       client_remove_in6_gw(c);
-    }
 #endif
+    }
     if (nfds == 0) {
       continue;
     }
