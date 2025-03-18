@@ -48,9 +48,8 @@ typedef struct ipv6hdr ipv6hdr;
 
 #elif defined(__MACH__)
 
-// #include <netinet/ip.h>
-// #include <netinet/ip6.h>
 #include <Security/Security.h>
+#include <ifaddrs.h>
 #include <net/if.h>
 #include <net/if_utun.h>
 #include <net/route.h>
@@ -696,7 +695,7 @@ static int get_def_gw(int af, char *gw, size_t gwlen, char *dev,
     if (af == AF_INET && dev) {
       char ifname[IFNAMSIZ];
       if (if_indextoname(ifindex, ifname)) {
-        strncpy(dev, ifname, devlen);
+        strncpy(dev, ifname, devlen - 1);
       } else {
         _log("if_indextoname failed");
         goto err_free_out;
@@ -1668,21 +1667,56 @@ out:
   fclose(fp);
   return up;
 #elif defined(__MACH__)
-  // TODO: check network on macos
-  return 1;
+  struct ifaddrs *ifaddr, *ifa;
+  int up = 0;
+  if (getifaddrs(&ifaddr) == -1) {
+    return 0;
+  }
+
+  for (ifa = ifaddr; ifa != NULL; ifa = ifa->ifa_next) {
+    if (ifa->ifa_addr == NULL)
+      continue;
+
+    if (strcmp(ifa->ifa_name, c->mif) == 0) {
+      if (ifa->ifa_flags & IFF_UP) {
+        if (ifa->ifa_addr->sa_family == AF_INET) {
+          up = 1;
+          break;
+        }
+      }
+    }
+  }
+
+  freeifaddrs(ifaddr);
+  return up;
 #endif
 }
 
-static int client_should_reconnect(ctx *c) {
+/*
+* return 1 to reconnect, otherwise 0.
+*
+*/
+static int client_conn_check(ctx *c) {
+  if (c->mode != CLIENT) return 0;
   if (!c->down) {
     if (!is_network_up(c)) {
       c->down = 1;
+      _log("network DOWN");
+    } else {
+#ifdef __MACH__
+      client_watch_def_gw(c);
+      // dirty hack: on macOS, ipv6 default gateway is always automatically
+      // added, which causes the VPN to not work for some sites that use ipv6,
+      // here just watch and remove it if present
+      client_remove_in6_gw(c);
+#endif
     }
     return 0;
   } else {
     if (!is_network_up(c)) {
       return 0;
     }
+    _log("network UP");
     return 1;
   }
 }
@@ -1698,7 +1732,7 @@ static void wait_for_stop(ctx *c, int port) {
     if (stop) {
       break;
     }
-    if (!off && client_should_reconnect(c)) {
+    if (!off && client_conn_check(c)) {
       time_t now = time(NULL);
       if (now - lastreconn > 5) {
         _log("connection was down, last reconnect: %ld, now: %ld, reconnect",
@@ -1708,13 +1742,6 @@ static void wait_for_stop(ctx *c, int port) {
       }
     }
     if (!off) {
-#ifdef __MACH__
-      client_watch_def_gw(c);
-      // dirty hack: on macOS, ipv6 default gateway is always automatically
-      // added, which causes the VPN to not work for some sites that use ipv6,
-      // here just watch and remove it if present
-      client_remove_in6_gw(c);
-#endif
     }
     if (nfds == 0) {
       continue;
