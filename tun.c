@@ -1661,10 +1661,9 @@ static int is_network_up(ctx *c) {
   char line[8];
   if (fgets(line, sizeof(line), fp) && !strncmp("up", line, 2)) {
     up = 1;
-    goto out;
   }
-out:
   fclose(fp);
+out:
   return up;
 #elif defined(__MACH__)
   struct ifaddrs *ifaddr, *ifa;
@@ -1740,8 +1739,6 @@ static void wait_for_stop(ctx *c, int port) {
         reconnect(c);
         lastreconn = time(NULL);
       }
-    }
-    if (!off) {
     }
     if (nfds == 0) {
       continue;
