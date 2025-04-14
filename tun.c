@@ -723,11 +723,11 @@ out:
 static int get_def(ctx *c) {
 
 #if defined(__linux__)
-
+  int err = -1;
   FILE *fp = fopen("/proc/net/route", "r");
   if (!fp) {
     _log("error opening /proc/net/route");
-    return -1;
+    goto out;
   }
   char line[100];
   while (fgets(line, 100, fp)) {
@@ -742,6 +742,7 @@ static int get_def(ctx *c) {
         sscanf(p, "%x", &gw);
         addr.s_addr = gw;
         strncpy(c->gw, inet_ntoa(addr), sizeof(c->gw) - 1);
+        err = 0;
       }
       break;
     }
@@ -750,10 +751,11 @@ static int get_def(ctx *c) {
 
 #elif defined(__MACH__)
   if (get_def_gw(AF_INET, c->gw, sizeof(c->gw), c->mif, sizeof(c->mif)) == -1) {
-    return -1;
+    goto out;
   }
 #endif
-  return 0;
+out:
+  return err;
 }
 
 #if defined(__MACH__)
@@ -1224,6 +1226,10 @@ static void *to_tun(void *hc) {
   int fd = c->tunfd;
   int n;
   while ((n = read(fd, c->send_buf, c->send_buf_len)) > 0) {
+    if (c->down) {
+      //network down
+      return NULL;
+    }
     unsigned char *buf = c->send_buf + TUN_PKT_OFFSET;
     if (!check_ip(buf)) {
       pr_debug("multicast ignored\n");
@@ -1650,10 +1656,15 @@ static void client_quit(ctx *c) {
 
 static int is_network_up(ctx *c) {
 #if defined(__linux__)
+  int up = 0;
   char buf[128];
+  if (strlen(c->mif) == 0) {
+    if (get_def(c) == -1) {
+      goto out;
+    }
+  }
   snprintf(buf, sizeof(buf), "/sys/class/net/%s/operstate", c->mif);
   FILE *fp = fopen(buf, "r");
-  int up = 0;
   if (!fp) {
     _log("error opening %s", buf);
     goto out;
@@ -1970,14 +1981,13 @@ int main(int argc, char **argv) {
 
   init_buffer(&context);
 
-  if (get_def(&context)) {
-    err_exit("error retrieving default gateway");
-  }
-
   if (mif) {
     strncpy(context.mif, mif, sizeof(context.mif) - 1);
   }
   if (m == SERVER) {
+    if (get_def(&context)) {
+      _log("error retrieving default gateway");
+    }
     context.tundev = dev ? dev : SDEV;
     init_server_ctx(&context);
     start_server(&context);
@@ -1992,7 +2002,7 @@ int main(int argc, char **argv) {
     context.tundev = dev ? dev : CDEV;
     context.vs = server;
     // connect
-    for (int i = 0; _connect(&context);) {
+    for (int i = 0; get_def(&context) || _connect(&context);) {
 #define RETRY_TO 5
       _log("connection failed, retry after %d seconds", RETRY_TO);
       sleep(RETRY_TO);
