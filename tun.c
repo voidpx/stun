@@ -3,11 +3,14 @@
  * supports Linux.
  *
  */
+#include <wait.h>
+#include <spawn.h>
 #include <ctype.h>
 #include <fcntl.h>
 #include <netdb.h>
 #include <netinet/in.h>
 #include <stdarg.h>
+#include <stdatomic.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
@@ -248,7 +251,7 @@ typedef struct ctx {
   EVP_CIPHER_CTX *enc_ctx;
   EVP_CIPHER_CTX *dec_ctx;
   char *tundev;
-  uint32_t sessionid;
+  atomic_uint sessionid;
   // server: port to listen on, client: port of the server to connect to
   int port;
   union {
@@ -277,7 +280,10 @@ typedef struct ctx {
   pthread_t to_tun, from_tun;
   int epollfd;
   int down;
-  unsigned char iv[GCM_IV_LEN];
+  union {
+    unsigned char iv[GCM_IV_LEN];
+    atomic_ulong ivl;
+  };
   char gw[16];
   char mif[IFNAMSIZ];
   unsigned char *recv_buf;
@@ -533,13 +539,48 @@ static int exec_cmd(char *fmt, ...) {
   va_end(va);
   if (n >= sizeof(cmd)) {
     fprintf(stderr, "command too long:\n");
-    va_list va2;
-    va_start(va2, fmt);
-    vfprintf(stderr, fmt, va2);
-    va_end(va2);
+    va_start(va, fmt);
+    vfprintf(stderr, fmt, va);
+    va_end(va);
+    return 1;
   }
-  _log("exeucting command: %s", cmd);
-  return system(cmd);
+
+  _log("executing command: %s", cmd);
+
+  char **argv = malloc(256 * sizeof(char *));
+  if (!argv) {
+    fprintf(stderr, "OOM");
+    exit(EXIT_FAILURE);
+  }
+  int i = 0;
+  char *p = cmd;
+  int in_arg = 0;
+  while (*p) {
+    if (i >= 255) break;
+    if (*p==' '||*p=='\t') {
+      *p = '\0';
+      in_arg = 0;
+      p++;
+      continue;
+    }
+    if (!in_arg) {
+      argv[i++] = p;
+      in_arg = 1;
+    }
+    p++;
+  }
+  argv[i] = NULL;
+
+  pid_t pid;
+  int ret = posix_spawnp(&pid, argv[0], NULL, NULL, (char * const*)argv, __environ);
+  int status = 1;
+  if (!ret) {
+    while (waitpid(pid, &status, 0)<0 && errno == EINTR);
+  } else {
+    errno = ret;
+  }
+  free(argv);
+  return status;
 }
 
 void int_handler(int sig, siginfo_t *si, void *a) {
@@ -772,7 +813,7 @@ static void setup_tun(ctx *c) {
   memset(&req, 0, sizeof(req));
   req.ifr_flags = IFF_TUN | IFF_NO_PI;
 
-  strcpy(req.ifr_name, c->tundev);
+  strncpy(req.ifr_name, c->tundev, sizeof(req.ifr_name));
 
   int r = ioctl(fd, TUNSETIFF, &req);
 
@@ -966,11 +1007,7 @@ static inline void set_block(int fd) {
 }
 
 static void update_iv(ctx *c) {
-  uint32_t r = rand();
-  uint64_t *p = (uint64_t *)c->iv;
-  *p = *p ^ (uint64_t)r;
-  uint32_t *p2 = (uint32_t *)(c->iv + 8);
-  *p2 = *p2 ^ r;
+  atomic_fetch_add(&c->ivl, 1);
 }
 
 static int enc_and_send(ctx *c, int so, unsigned char *key, unsigned char *buf,
@@ -1069,7 +1106,7 @@ static void tun_handshake(ctx *c, int so, struct sockaddr_in *remote,
       ip_allocated:
         idx = h2idx(ip[3]);
         c->clients[idx].id = *(uint32_t *)kid;
-        c->clients[idx].sessionid = c->sessionid++;
+        c->clients[idx].sessionid = atomic_fetch_add(&c->sessionid, 1);
         c->clients[idx].key = key;
         c->clients[idx].addr = *remote;
         c->clients[idx].tun_ipv4 = *(uint32_t *)ip;
