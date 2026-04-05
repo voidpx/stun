@@ -3,7 +3,6 @@
  * supports Linux.
  *
  */
-#include <wait.h>
 #include <spawn.h>
 #include <ctype.h>
 #include <fcntl.h>
@@ -36,6 +35,7 @@
 
 #if defined(__linux__)
 
+#include <wait.h>
 #include <linux/if.h>
 #include <linux/if_ether.h>
 #include <linux/if_tun.h>
@@ -50,6 +50,9 @@ typedef struct ipv6hdr ipv6hdr;
 #define TUN_PKT_OFFSET 0
 
 #elif defined(__MACH__)
+
+#include <crt_externs.h>
+#define __environ (*_NSGetEnviron())
 
 #include <Security/Security.h>
 #include <ifaddrs.h>
@@ -762,13 +765,12 @@ out:
 #endif
 
 static int get_def(ctx *c) {
-
-#if defined(__linux__)
   int err = -1;
+#if defined(__linux__)
   FILE *fp = fopen("/proc/net/route", "r");
   if (!fp) {
     _log("error opening /proc/net/route");
-    goto out;
+    return err;
   }
   char line[100];
   while (fgets(line, 100, fp)) {
@@ -791,11 +793,8 @@ static int get_def(ctx *c) {
   fclose(fp);
 
 #elif defined(__MACH__)
-  if (get_def_gw(AF_INET, c->gw, sizeof(c->gw), c->mif, sizeof(c->mif)) == -1) {
-    goto out;
-  }
+  err = get_def_gw(AF_INET, c->gw, sizeof(c->gw), c->mif, sizeof(c->mif));
 #endif
-out:
   return err;
 }
 
