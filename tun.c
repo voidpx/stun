@@ -125,8 +125,18 @@ typedef struct ipv6hdr {
 #define PROTO_OP_FORWARD 'F' // forward
 #define PROTO_OP_FIN 'Q'     // quit
 
+#if defined(__linux__)
+
 #define MTU                                                                    \
   (1500 - 20 - GCM_TAG_LEN - GCM_IV_LEN - 8) // max without fragmentation
+
+#elif defined(__MACH__)
+
+#define MTU 1380 
+
+#endif
+
+
 #define SERVER_MTU 9001
 
 #define LOG_FILE "/var/log/tun.log"
